@@ -2,15 +2,16 @@
 setlocal
 
 if exist .\_project\vs2022\streamline.sln (
-    rem find VS 2022
-    for /f "usebackq tokens=1* delims=: " %%i in (`.\tools\vswhere.exe -version [17^,18^) -requires Microsoft.VisualStudio.Workload.NativeDesktop`) do (
+    rem find VS 2022 or newer (VS2026 == version 18). Range [17,19) covers both; the vs2022
+    rem project tree is format-compatible and the v145 toolset is forced via premake.lua.
+    for /f "usebackq tokens=1* delims=: " %%i in (`.\tools\vswhere.exe -version [17^,19^) -requires Microsoft.VisualStudio.Workload.NativeDesktop`) do (
         if /i "%%i"=="installationPath" (
             set VS_PATH=%%j
             GOTO :found_vs
         )
     )
-    rem Try looking for VS Build Tools 2022
-    for /f "usebackq tokens=1* delims=: " %%i in (`.\tools\vswhere.exe -products * -version [17^,18^) -requires Microsoft.VisualStudio.Workload.VCTools -requires Microsoft.VisualStudio.Workload.MSBuildTools`) do (
+    rem Try looking for VS Build Tools 2022 or newer
+    for /f "usebackq tokens=1* delims=: " %%i in (`.\tools\vswhere.exe -products * -version [17^,19^) -requires Microsoft.VisualStudio.Workload.VCTools -requires Microsoft.VisualStudio.Workload.MSBuildTools`) do (
         if /i "%%i"=="installationPath" (
             set VS_PATH=%%j
             GOTO :found_vs

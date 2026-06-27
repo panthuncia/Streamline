@@ -1,5 +1,15 @@
 require("vstudio")
 
+-- VS2026 retarget: premake5-beta1 has no vs2026 action and its `toolset` allow-list predates the
+-- v145 platform toolset, so neither the action nor `toolset "v145"` can emit it. Override the
+-- generated <PlatformToolset> element directly. The vs2022 action still produces a format-compatible
+-- project tree (the _project/vs2022 folder name is cosmetic); only the toolset string needs bumping so
+-- VS2026's MSBuild (which only ships v145) accepts it. Set SL_PLATFORM_TOOLSET to override.
+local SL_PLATFORM_TOOLSET = os.getenv("SL_PLATFORM_TOOLSET") or "v145"
+premake.override(premake.vstudio.vc2010, "platformToolset", function(base, cfg)
+	premake.w('<PlatformToolset>%s</PlatformToolset>', SL_PLATFORM_TOOLSET)
+end)
+
 local ROOT = path.getabsolute("./") .. "/"
 local TOOLS = path.getabsolute("./tools") .. "/"
 local EXTERNAL = path.getabsolute("./external") .. "/"
@@ -560,9 +570,52 @@ project "sl.template"
 	}
 
 	vpaths { ["impl"] = {"./source/plugins/sl.template/**.h", "./source/plugins/sl.template/**.cpp" }}
-			
+
 	removefiles {"./source/core/sl.extra/extra.cpp"}
 
+-- Community Shaders sl.fsr plugin: AMD FidelityFX FSR3 upscaling + frame generation.
+project "sl.fsr"
+	kind "SharedLib"
+	targetdir (out_dynamic_lib_dir())
+	objdir (out_obj_dir())
+	characterset ("MBCS")
+	pluginBasicSetup("fsr")
+
+	-- FFX-API public headers (descriptor structs for the prebuilt amd_fidelityfx_vk.dll, resolved at
+	-- runtime via LoadLibrary). FFX now lives inside the fork; CS no longer references it directly.
+	includedirs { "./external/fidelityfx-sdk/ffx-api/include" }
+
+	files {
+		"./source/plugins/sl.fsr/**.json",
+		"./source/plugins/sl.fsr/**.h",
+		"./source/plugins/sl.fsr/**.cpp"
+	}
+
+	vpaths { ["impl"] = {"./source/plugins/sl.fsr/**.h", "./source/plugins/sl.fsr/**.cpp" }}
+
+	removefiles {"./source/core/sl.extra/extra.cpp"}
+
+-- Community Shaders sl.xess plugin: Intel XeSS super-resolution upscaling (upscale-only).
+project "sl.xess"
+	kind "SharedLib"
+	targetdir (out_dynamic_lib_dir())
+	objdir (out_obj_dir())
+	characterset ("MBCS")
+	pluginBasicSetup("xess")
+
+	-- Intel XeSS public headers (xess.h / xess_vk.h; libxess.dll resolved at runtime). XeSS now lives
+	-- inside the fork; CS no longer references it directly.
+	includedirs { "./external/xess-sdk/include" }
+
+	files {
+		"./source/plugins/sl.xess/**.json",
+		"./source/plugins/sl.xess/**.h",
+		"./source/plugins/sl.xess/**.cpp"
+	}
+
+	vpaths { ["impl"] = {"./source/plugins/sl.xess/**.h", "./source/plugins/sl.xess/**.cpp" }}
+
+	removefiles {"./source/core/sl.extra/extra.cpp"}
 
 project "sl.nis"
 	kind "SharedLib"

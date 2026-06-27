@@ -1,0 +1,9 @@
+{
+    "id": 1006,
+    "priority": 100,
+    "name": "sl.xess",
+    "namespace": "xess",
+    "required_plugins": ["sl.common"],
+    "rhi": ["vk"],
+    "hooks": []
+}
