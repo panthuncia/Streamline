@@ -8,6 +8,7 @@
 */
 
 #include <cstring>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -68,20 +69,27 @@ struct FSRContext
     std::map<uint32_t, FSRFrameGenOptions> fgOptions;
 
     // --- Frame generation (FFX FrameInterpolationSwapChainVK proxy) -----------------------------
-    // The host enables FSR FG (slFSRFrameGenerationSetOptions) and triggers a DXVK swapchain
-    // recreate; our eVulkan_CreateSwapchainKHR before-hook then replaces DXVK's swapchain with an
-    // FFX FrameInterpolationSwapChain that interpolates + double-presents internally. The other WSI
-    // before-hooks (GetSwapchainImages/AcquireNextImage/Present/DestroySwapchain) route the wrapped
-    // handle to FFX's replacement functions. Per-frame depth/MV/camera is recorded by an FG-prepare
-    // dispatch appended to the upscale (fsrEndEvaluation).
-    bool fgEnabled = false;                  // host requested FSR FG for the active viewport
+    // DXVK's swapchain is ALWAYS replaced with an FFX FrameInterpolationSwapChain in the
+    // eVulkan_CreateSwapchainKHR before-hook, independent of whether FG is enabled. With FG disabled the
+    // FFX swapchain is a 1:1 passthrough (frameGenerationEnabled=false), so toggling FG is just an
+    // ffxConfigure in the present hook — never a swapchain recreate (which was the source of every FG
+    // toggle freeze/deadlock). The other WSI before-hooks (GetSwapchainImages/AcquireNextImage/Present/
+    // DestroySwapchain) route the wrapped handle to FFX's replacement functions. Per-frame depth/MV/camera
+    // is recorded by an FG-prepare dispatch appended to the upscale (fsrEndEvaluation).
+    bool fgEnabled = false;                  // host requested FSR FG; gates frameGenerationEnabled only
     bool fgPreparedThisFrame = false;        // an FG-prepare ran this frame -> safe to interpolate
     bool fgColorHDR = false;
-    bool fgRecreateInFlight = false;         // a wrap/unwrap recreate was triggered, awaiting the hook
-    bool fgWrapFailed = false;               // createFgSwapchain failed; suppress retrigger until toggled
-    bool fgUpscaleSinceLastPresent = false;  // an upscale ran this present cycle -> in gameplay (gate the
-                                             // initial wrap: building the FFX swapchain at a menu/loading
-                                             // screen, with no frame production, deadlocks its init)
+    uint32_t fgDebugFlags = 0;               // FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_* from the host's debug toggles
+    bool fgOnlyPresentGenerated = false;     // present only generated frames (host fgShowOnlyGenerated)
+    bool fgGameplayReached = false;          // an upscale has run -> frames are flowing -> safe to install
+                                             // the FFX FG swapchain. Building it at cold init / a no-frame
+                                             // loading screen crashes its setup, so the wrap is deferred to
+                                             // here. Latched on; never cleared (the swapchain stays wrapped
+                                             // for the rest of the session, FG on/off is configure-only).
+    bool fgBootstrapInFlight = false;        // de-bounce the single present->SUBOPTIMAL recreate that
+                                             // installs the FFX swapchain the first time gameplay is reached.
+    bool fgWrapFailed = false;               // createFgSwapchain failed -> stop retriggering the bootstrap
+                                             // (else present->recreate->fail loops every frame).
     uint64_t frameID = 0;
     PFN_vkQueuePresentKHR realQueuePresentKHR = nullptr;
     ffxContext fgContext = nullptr;          // interpolation context (ffxCreateContextDescFrameGeneration)
@@ -89,6 +97,7 @@ struct FSRContext
     VkSwapchainKHR fgWrappedSwapchain = VK_NULL_HANDLE;
     ffxQueryDescSwapchainReplacementFunctionsVK fgSwapchainFns{};
     uint32_t fgDisplayW = 0, fgDisplayH = 0, fgRenderW = 0, fgRenderH = 0, fgBackBufferFormat = 0;
+    bool fgContextHDR = false;  // the HDR flag the current fgContext was actually built with (vs fgColorHDR desired)
 
     // The three queues FFX's FG swapchain requires. gameQueue is DXVK's own present queue (captured
     // from the first passthrough present); presentQueue/imageAcquireQueue are the two extra graphics
@@ -117,6 +126,13 @@ namespace
 //   vkCmdWriteBufferMarker(2)AMD (DXVK enumerates VK_AMD_buffer_marker but leaves the entries NULL).
 // Route the first to the core entry; stub the markers to a no-op so the UNMODIFIED DLL runs on DXVK.
 PFN_vkGetDeviceProcAddr g_realDeviceProcAddr = nullptr;
+
+// Set while FFX creates its OWN (inner) swapchain inside createFgSwapchain. FFX's inner vkCreateSwapchainKHR
+// re-enters the SL interposer, where our CreateSwapchainKHR hook sees this flag and creates the swapchain
+// on the GENUINE driver with Skip=true — so the interposer's other plugin hooks (sl.dlss_g, which would
+// otherwise also wrap FFX's swapchain → two FG present owners → device-lost) never touch it. This is what
+// lets FSR FG and DLSS-G stay loaded together and be switched in-game.
+std::atomic<bool> g_creatingFgSwapchain{ false };
 
 VKAPI_ATTR void VKAPI_CALL Noop_vkCmdWriteBufferMarker(
     VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize, uint32_t) {}
@@ -390,7 +406,8 @@ bool acquireFgQueues(fsr::FSRContext& ctx)
 bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH, uint32_t renderW, uint32_t renderH, uint32_t backBufferFormat)
 {
     if (ctx.fgContext && ctx.fgDisplayW == displayW && ctx.fgDisplayH == displayH &&
-        ctx.fgRenderW >= renderW && ctx.fgRenderH >= renderH && ctx.fgBackBufferFormat == backBufferFormat)
+        ctx.fgRenderW >= renderW && ctx.fgRenderH >= renderH && ctx.fgBackBufferFormat == backBufferFormat &&
+        ctx.fgContextHDR == ctx.fgColorHDR)  // HDR flag is baked into fgDesc.flags at create -> recreate if it changed
         return true;
     if (ctx.fgContext) {
         ffxDestroyContextSEH(ctx.ffxApi, &ctx.fgContext);
@@ -424,6 +441,7 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     }
     ctx.fgDisplayW = displayW; ctx.fgDisplayH = displayH; ctx.fgRenderW = renderW; ctx.fgRenderH = renderH;
     ctx.fgBackBufferFormat = backBufferFormat;
+    ctx.fgContextHDR = ctx.fgColorHDR;
     ctx.frameID = 0;
     SL_LOG_INFO("sl.fsr: FFX FG context created (display %ux%u render %ux%u)", displayW, displayH, renderW, renderH);
     return true;
@@ -501,7 +519,11 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     desc.presentQueue = presentQ;
     desc.imageAcquireQueue = acquireQ;
 
+    // FFX creates its inner real swapchain here; intercept that re-entrant CreateSwapchainKHR (see the hook)
+    // so it bypasses the interposer's other plugins.
+    g_creatingFgSwapchain.store(true, std::memory_order_release);
     ffxReturnCode_t rc = ffxCreateContextSEH(ctx.ffxApi, &ctx.fgSwapchainContext, &desc.header);
+    g_creatingFgSwapchain.store(false, std::memory_order_release);
     if (rc != FFX_API_RETURN_OK || !ctx.fgSwapchainContext) {
         SL_LOG_ERROR("sl.fsr: FG swapchain CreateContext failed 0x%08X", (uint32_t)rc);
         ctx.fgSwapchainContext = nullptr;
@@ -557,107 +579,123 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
         return Result::eErrorMissingConstants;
 
     CommonResource colorIn{}, colorOut{}, depth{}, mvec{};
-    getTaggedResource(kBufferTypeScalingInputColor, colorIn, evd.frame, evd.id, false, inputs, numInputs);
-    getTaggedResource(kBufferTypeScalingOutputColor, colorOut, evd.frame, evd.id, false, inputs, numInputs);
+    // Color is OPTIONAL: this single kFeatureFSR evaluate serves both FSR upscale (color present) and the
+    // standalone FG-prepare the host drives on a dedicated viewport (depth+MV only, no color). Query color
+    // with optional=true so the absence on the FG-prepare viewport doesn't spam tag-not-found errors every
+    // frame. Depth+MV stay required (optional=false) — their absence is a real error.
+    getTaggedResource(kBufferTypeScalingInputColor, colorIn, evd.frame, evd.id, true, inputs, numInputs);
+    getTaggedResource(kBufferTypeScalingOutputColor, colorOut, evd.frame, evd.id, true, inputs, numInputs);
     getTaggedResource(kBufferTypeDepth, depth, evd.frame, evd.id, false, inputs, numInputs);
     getTaggedResource(kBufferTypeMotionVectors, mvec, evd.frame, evd.id, false, inputs, numInputs);
-    if (!colorIn || !colorOut || !depth || !mvec)
+    // This single kFeatureFSR evaluate serves two roles, distinguished by what the host tagged:
+    //   * color + depth + MV  -> FSR UPSCALE (+ FG-prepare if FG is on and using FSR upscale)
+    //   * depth + MV only      -> standalone FG-PREPARE, which the host drives EVERY frame so FSR frame
+    //                             generation works under ANY upscaler (XeSS/DLSS/none), not just FSR.
+    // Depth + MV are mandatory for both.
+    if (!depth || !mvec)
         return Result::eErrorMissingInputParameter;
+    const bool haveColor = (colorIn && colorOut);
 
-    const auto& inExt = colorIn.getExtent();
-    const auto& outExt = colorOut.getExtent();
-    const uint32_t renderW = inExt.width, renderH = inExt.height;
-    const uint32_t outputW = outExt.width, outputH = outExt.height;
-    if (!renderW || !renderH || !outputW || !outputH)
+    const auto& depthExt = depth.getExtent();
+    const uint32_t renderW = haveColor ? colorIn.getExtent().width  : depthExt.width;
+    const uint32_t renderH = haveColor ? colorIn.getExtent().height : depthExt.height;
+    const uint32_t outputW = haveColor ? colorOut.getExtent().width  : renderW;
+    const uint32_t outputH = haveColor ? colorOut.getExtent().height : renderH;
+    if (!renderW || !renderH)
         return Result::eErrorMissingInputParameter;
-
-    float sharpness = 0.0f;
-    {
-        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
-        auto it = ctx.upscaleOptions.find((uint32_t)evd.id);
-        if (it != ctx.upscaleOptions.end()) {
-            if (it->second.mode == FSRMode::eOff)
-                return Result::eOk;
-            sharpness = it->second.sharpness;
-        }
-    }
-
-    if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH)) {
-        ctx.dispatchFaulted = true;
-        return Result::eErrorExceptionHandler;
-    }
 
     VkCommandBuffer cmd = (VkCommandBuffer)cmdList;
     std::vector<Barrier> restore;
 
-    ffxDispatchDescUpscale dp{};
-    dp.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    dp.commandList = reinterpret_cast<void*>(cmd);
-    dp.color = wrapAndTransition(ctx, cmd, colorIn, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
-    dp.depth = wrapAndTransition(ctx, cmd, depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET, true, restore);
-    dp.motionVectors = wrapAndTransition(ctx, cmd, mvec, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
-    dp.reactive = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dp.transparencyAndComposition = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dp.exposure = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dp.output = wrapAndTransition(ctx, cmd, colorOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV, false, restore);
+    // Depth + MV feed both the upscale and the FG-prepare; wrap+transition once and share.
+    FfxApiResource depthRes = wrapAndTransition(ctx, cmd, depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET, true, restore);
+    FfxApiResource mvecRes = wrapAndTransition(ctx, cmd, mvec, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
+    const FfxApiFloatCoords2D motionVectorScale = { (float)renderW, (float)renderH };
+    // consts->jitterOffset is ALREADY negated by the host (matching SL/DLSS + FFX's expected -jitter);
+    // pass it straight through — negating again was a double-negation that ghosts under motion.
+    const FfxApiFloatCoords2D jitterOffset = { consts->jitterOffset.x, consts->jitterOffset.y };
 
-    dp.motionVectorScale = { (float)renderW, (float)renderH };
-    dp.renderSize = { renderW, renderH };
-    dp.upscaleSize = { outputW, outputH };
-    // consts->jitterOffset is ALREADY negated by the host (CS EvaluateFSR), matching the SL/DLSS
-    // convention and FFX's expected -jitter. Pass it straight through — do NOT negate again (that was
-    // a double-negation giving +jitter → ghosting/instability under motion).
-    dp.jitterOffset = { consts->jitterOffset.x, consts->jitterOffset.y };
-    dp.frameTimeDelta = 16.6f;
-    dp.cameraFar = consts->cameraFar;
-    dp.cameraNear = consts->cameraNear;
-    dp.enableSharpening = sharpness > 0.0f;
-    dp.sharpness = sharpness;
-    dp.cameraFovAngleVertical = consts->cameraFOV;
-    dp.viewSpaceToMetersFactor = 0.01428222656f;
-    dp.reset = false;
-    dp.preExposure = 1.0f;
-    dp.flags = 0;
+    ffxReturnCode_t rc = FFX_API_RETURN_OK;
 
-    ffxReturnCode_t rc = ffxDispatchSEH(ctx.ffxApi, &ctx.upscaleContext, &dp.header);
+    if (haveColor) {
+        float sharpness = 0.0f;
+        {
+            std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+            auto it = ctx.upscaleOptions.find((uint32_t)evd.id);
+            if (it != ctx.upscaleOptions.end()) {
+                if (it->second.mode == FSRMode::eOff)
+                    return Result::eOk;
+                sharpness = it->second.sharpness;
+            }
+        }
+        if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH)) {
+            ctx.dispatchFaulted = true;
+            return Result::eErrorExceptionHandler;
+        }
 
-    // An upscale ran -> we're in gameplay (post-processing), so the present hook may now safely build the
-    // FFX FG swapchain. Set regardless of wrap state so the very first wrap is gated on real frame production.
-    if (rc == FFX_API_RETURN_OK && ctx.fgEnabled)
-        ctx.fgUpscaleSinceLastPresent = true;
+        ffxDispatchDescUpscale dp{};
+        dp.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        dp.commandList = reinterpret_cast<void*>(cmd);
+        dp.color = wrapAndTransition(ctx, cmd, colorIn, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
+        dp.depth = depthRes;
+        dp.motionVectors = mvecRes;
+        dp.reactive = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dp.transparencyAndComposition = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dp.exposure = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dp.output = wrapAndTransition(ctx, cmd, colorOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV, false, restore);
+        dp.motionVectorScale = motionVectorScale;
+        dp.renderSize = { renderW, renderH };
+        dp.upscaleSize = { outputW, outputH };
+        dp.jitterOffset = jitterOffset;
+        dp.frameTimeDelta = 16.6f;
+        dp.cameraFar = consts->cameraFar;
+        dp.cameraNear = consts->cameraNear;
+        dp.enableSharpening = sharpness > 0.0f;
+        dp.sharpness = sharpness;
+        dp.cameraFovAngleVertical = consts->cameraFOV;
+        dp.viewSpaceToMetersFactor = 0.01428222656f;
+        dp.reset = false;
+        dp.preExposure = 1.0f;
+        dp.flags = 0;
+        rc = ffxDispatchSEH(ctx.ffxApi, &ctx.upscaleContext, &dp.header);
 
-    // FG-prepare on the interpolation context: records this frame's dilated depth/MV + camera/render
-    // size that the present-time interpolation reads. Reuses the upscale's already-transitioned
-    // depth/MV resources (still in COMPUTE_READ here, before the restore below), the same frameID the
-    // following present consumes, and the same SL command buffer. Only when the FG swapchain is live.
-    if (rc == FFX_API_RETURN_OK && ctx.fgEnabled && ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
-        ffxDispatchDescFrameGenerationPrepare prep{};
-        prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-        prep.frameID = ctx.frameID;
-        prep.flags = 0;
-        prep.commandList = reinterpret_cast<void*>(cmd);
-        prep.renderSize = dp.renderSize;
-        prep.jitterOffset = dp.jitterOffset;
-        prep.motionVectorScale = dp.motionVectorScale;
-        prep.frameTimeDelta = dp.frameTimeDelta;
-        prep.unused_reset = false;
-        prep.cameraNear = dp.cameraNear;
-        prep.cameraFar = dp.cameraFar;
-        prep.cameraFovAngleVertical = dp.cameraFovAngleVertical;
-        prep.viewSpaceToMetersFactor = dp.viewSpaceToMetersFactor;
-        prep.depth = dp.depth;
-        prep.motionVectors = dp.motionVectors;
-        ctx.fgPreparedThisFrame = (ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK);
+        static ffxReturnCode_t s_logged = ~0u;
+        if (rc != s_logged) {
+            s_logged = rc;
+            SL_LOG_INFO("sl.fsr: ffxDispatch(upscale) rc=0x%08X render=%ux%u output=%ux%u", (uint32_t)rc, renderW, renderH, outputW, outputH);
+        }
+    }
+
+    // FG-prepare: runs whenever the host wants FG, regardless of which upscaler produced the frame. It
+    // records this frame's dilated depth/MV + camera/render size for the present-time interpolation.
+    // Setting fgGameplayReached lets the present hook bootstrap-install the FFX swapchain; the prepare
+    // dispatch itself only runs once that swapchain (and its FG context) exists.
+    if (ctx.fgEnabled) {
+        ctx.fgGameplayReached = true;
+        if (ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
+            ffxDispatchDescFrameGenerationPrepare prep{};
+            prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+            prep.frameID = ctx.frameID;
+            prep.flags = 0;
+            prep.commandList = reinterpret_cast<void*>(cmd);
+            prep.renderSize = { renderW, renderH };
+            prep.jitterOffset = jitterOffset;
+            prep.motionVectorScale = motionVectorScale;
+            prep.frameTimeDelta = 16.6f;
+            prep.unused_reset = false;
+            prep.cameraNear = consts->cameraNear;
+            prep.cameraFar = consts->cameraFar;
+            prep.cameraFovAngleVertical = consts->cameraFOV;
+            prep.viewSpaceToMetersFactor = 0.01428222656f;
+            prep.depth = depthRes;
+            prep.motionVectors = mvecRes;
+            ctx.fgPreparedThisFrame = (ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK);
+        }
     }
 
     for (auto it = restore.rbegin(); it != restore.rend(); ++it)
         recordBarrier(ctx, cmd, { it->image, it->oldLayout, it->newLayout, it->aspect });
 
-    static ffxReturnCode_t s_logged = ~0u;
-    if (rc != s_logged) {
-        s_logged = rc;
-        SL_LOG_INFO("sl.fsr: ffxDispatch(upscale) rc=0x%08X render=%ux%u output=%ux%u", (uint32_t)rc, renderW, renderH, outputW, outputH);
-    }
     if (rc != FFX_API_RETURN_OK)
         return Result::eErrorComputeFailed;
     return Result::eOk;
@@ -700,16 +738,25 @@ sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, co
     auto& ctx = (*fsr::getContext());
     std::lock_guard<std::mutex> lock(ctx.optionsMutex);
     ctx.fgOptions[(uint32_t)viewport] = options;
-    // Drives the CreateSwapchainKHR hook: the host enables/disables FSR FG here and then triggers a
-    // DXVK swapchain recreate so the hook (re)wraps or releases the FFX FG swapchain. We do NOT create
-    // or destroy the FFX swapchain here (no VkSwapchainCreateInfoKHR yet) — only latch the request.
     const bool want = options.enabled == Boolean::eTrue;
     if (want != ctx.fgEnabled) {
-        ctx.fgEnabled = want;
-        ctx.fgWrapFailed = false;       // fresh toggle: allow the present hook to (re)trigger the recreate
-        ctx.fgRecreateInFlight = false;
+        // A real on/off edge: let the present hook (re)trigger the wrap/unwrap recreate this frame.
+        ctx.fgBootstrapInFlight = false;
+        ctx.fgWrapFailed = false;
     }
+    ctx.fgEnabled = want;
     ctx.fgColorHDR = options.colorBuffersHDR == Boolean::eTrue;
+    // Debug overlays applied per-present via ffxConfigureDescFrameGeneration (see slHookVkQueuePresentKHR).
+    ctx.fgDebugFlags =
+        (options.debugView == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0u) |
+        (options.debugTearLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0u) |
+        (options.debugPacingLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES : 0u);
+    ctx.fgOnlyPresentGenerated = options.onlyPresentGenerated == Boolean::eTrue;
+    // Publish to the shared param store so the interposer's vkCreateSwapchainKHR dispatch suppresses
+    // sl.dlss_g's swapchain hook while FSR FG owns present (prevents the two-present-owner device-lost,
+    // enabling in-game FSR-FG ↔ DLSS-G switching).
+    if (auto* p = api::getContext()->parameters)
+        p->set("sl.fsr.fgActive", want);
     return Result::eOk;
 }
 
@@ -734,13 +781,30 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
 {
     auto& ctx = (*fsr::getContext());
     ctx.device = Device;
+    // Re-entrant FFX inner swapchain creation: create it on the GENUINE driver and Skip the interposer's
+    // remaining hooks so sl.dlss_g never wraps FFX's swapchain (the device-lost collision).
+    if (g_creatingFgSwapchain.load(std::memory_order_acquire) && ctx.realDeviceProcAddr) {
+        auto realCreate = reinterpret_cast<PFN_vkCreateSwapchainKHR>(ctx.realDeviceProcAddr(Device, "vkCreateSwapchainKHR"));
+        if (realCreate) {
+            VkResult r = realCreate(Device, CreateInfo, Allocator, Swapchain);
+            Skip = true;
+            SL_LOG_INFO("sl.fsr: FFX inner CreateSwapchainKHR routed to genuine loader (rc=%d)", (int)r);
+            return r;
+        }
+    }
+    SL_LOG_INFO("sl.fsr: CreateSwapchainKHR (fgEnabled=%d) — %s",
+        (int)ctx.fgEnabled,
+        (ctx.platform == RenderAPI::eVulkan && ctx.fgEnabled) ? "will wrap" : "pass-through");
     if (ctx.physicalDevice == VK_NULL_HANDLE) {
         chi::PhysicalDevice physical{};
         if (ctx.compute) { ctx.compute->getPhysicalDevice(physical); ctx.physicalDevice = (VkPhysicalDevice)physical; }
     }
-    // Only proxy when the host has FSR FG enabled (it triggers a swapchain recreate on toggle so this
-    // hook re-runs). Otherwise let the interposer create the normal swapchain.
-    if (!ctx.fgEnabled || ctx.platform != RenderAPI::eVulkan) {
+    // Wrap with the FFX FG swapchain ONLY while FSR FG is the active method (ctx.fgEnabled). When FSR FG is
+    // off (disabled, or DLSS-G selected) we leave DXVK's plain swapchain so present flows back through the
+    // SL interposer — that is the path DLSS-G needs. The present hook drives the recreate that re-enters
+    // this hook on every on/off transition, so FSR FG ↔ DLSS-G ↔ disabled switch in-game. Gating on
+    // fgEnabled (never set at cold init / menus) also avoids the no-frame-production crash.
+    if (ctx.platform != RenderAPI::eVulkan || !ctx.fgEnabled) {
         Skip = false;
         return VK_SUCCESS;
     }
@@ -748,14 +812,14 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
         Skip = false;
         return VK_SUCCESS;
     }
-    ctx.fgRecreateInFlight = false;  // the recreate we asked for has arrived
+    ctx.fgBootstrapInFlight = false;  // the bootstrap recreate we asked for has arrived
     if (createFgSwapchain(ctx, Device, CreateInfo, Allocator, Swapchain)) {
         Skip = true;  // *Swapchain now holds FFX's wrapped handle
         ctx.fgWrapFailed = false;
     } else {
         SL_LOG_WARN("sl.fsr: FG swapchain proxy failed; falling back to a normal swapchain");
         Skip = false;
-        ctx.fgWrapFailed = true;  // suppress retrigger until the host toggles FG again
+        ctx.fgWrapFailed = true;  // don't loop on the bootstrap recreate
     }
     return VK_SUCCESS;
 }
@@ -765,7 +829,6 @@ void slHookVkDestroySwapchainKHR(VkDevice /*Device*/, VkSwapchainKHR Swapchain, 
     auto& ctx = (*fsr::getContext());
     if (Swapchain != VK_NULL_HANDLE && Swapchain == ctx.fgWrappedSwapchain) {
         destroyFgSwapchain(ctx);  // FFX's DestroyContext destroys the real VkSwapchainKHR it owns
-        ctx.fgRecreateInFlight = false;
         Skip = true;
     } else {
         Skip = false;
@@ -809,21 +872,21 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
     if (ctx.gameQueue == VK_NULL_HANDLE)
         ctx.gameQueue = Queue;
 
-    // --- Self-triggered swapchain recreate (the ONLY recreate path that works under full interposition;
-    // DxvkWsiHook is bypassed). When the desired wrap state (fgEnabled) differs from the actual state
-    // (is this swapchain wrapped?), present this frame normally THEN return VK_SUBOPTIMAL_KHR: DXVK
-    // recreates its swapchain, which re-enters our CreateSwapchainKHR hook to (un)wrap. Presenting first
-    // avoids the dangling-fence hang of a no-present OUT_OF_DATE. fgRecreateInFlight de-bounces it to one
-    // trigger per recreate; fgWrapFailed suppresses an infinite loop if the wrap can't be built.
+    // Bidirectional wrap/unwrap so FSR FG ↔ DLSS-G ↔ disabled switch in-game. The desired state is "wrapped
+    // iff FSR FG is on" (ctx.fgEnabled); the actual state is whether THIS swapchain is our FFX handle. On a
+    // mismatch, present this frame on its real path then return VK_SUBOPTIMAL_KHR so DXVK recreates its
+    // swapchain — re-entering CreateSwapchainKHR, which wraps (fgEnabled) or leaves it plain (returning
+    // present to SL for DLSS-G). Presenting first avoids the dangling-fence hang of a no-present OUT_OF_DATE.
+    // fgBootstrapInFlight de-bounces to one trigger per recreate; fgWrapFailed stops a wrap-fail loop.
     const bool wantWrap = ctx.fgEnabled;
-    const bool inGameplay = ctx.fgUpscaleSinceLastPresent;
-    ctx.fgUpscaleSinceLastPresent = false;  // consume; re-set by the next upscale
-    const bool needRecreate = !ctx.fgRecreateInFlight && !ctx.fgWrapFailed &&
-        ((wantWrap && ctx.fgWrappedSwapchain == VK_NULL_HANDLE && inGameplay) ||  // start wrapping (gameplay only)
-         (!wantWrap && wrapped));                                                 // stop wrapping (safe anytime)
+    const bool needRecreate = ctx.fgGameplayReached && !ctx.fgBootstrapInFlight && !ctx.fgWrapFailed &&
+        ((wantWrap && ctx.fgWrappedSwapchain == VK_NULL_HANDLE && !wrapped) ||  // turn ON: install FFX wrap
+         (!wantWrap && wrapped));                                               // turn OFF: drop back to plain
     if (needRecreate) {
-        // Present the frame on its real path: FFX's present if this is the wrapped swapchain (FG turning
-        // off), else the real ICD present (FG turning on, still a normal swapchain).
+        ctx.fgBootstrapInFlight = true;
+        Skip = true;
+        // Present this frame on the path that owns it now: FFX's present if currently wrapped (turning OFF),
+        // else the genuine driver present (turning ON, still a plain swapchain).
         VkResult pr;
         if (wrapped && ctx.fgSwapchainFns.pOutQueuePresentKHR)
             pr = ctx.fgSwapchainFns.pOutQueuePresentKHR(Queue, PresentInfo);
@@ -831,27 +894,29 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
             pr = ctx.realQueuePresentKHR(Queue, PresentInfo);
         else
             pr = VK_SUCCESS;
-        ctx.fgRecreateInFlight = true;
-        Skip = true;
-        SL_LOG_INFO("sl.fsr: requesting swapchain recreate to %s FG (present rc=%d)", wantWrap ? "ENABLE" : "disable", (int)pr);
-        return pr < 0 ? pr : VK_SUBOPTIMAL_KHR;  // SUBOPTIMAL -> DXVK recreates -> CreateSwapchainKHR hook
+        SL_LOG_INFO("sl.fsr: recreate to %s FG (present rc=%d)", wantWrap ? "ENABLE" : "DISABLE", (int)pr);
+        return pr < 0 ? pr : VK_SUBOPTIMAL_KHR;
     }
 
+    // Not our wrapped handle (FSR FG off, or an overlay's own swapchain) — pass through untouched.
     if (!wrapped) {
         Skip = false;
         return VK_SUCCESS;
     }
 
-    // Enable interpolation only on frames an FG-prepare actually ran for (else FFX reads empty inputs
-    // -> GPU device-lost). Configure per-present, matching the canonical FFX sample.
+    // Interpolate ONLY when the host wants FG AND an FG-prepare ran this frame (else FFX reads empty
+    // inputs -> GPU device-lost). FG-off or non-gameplay (menu/loading) frames present 1:1. Configure
+    // per-present, matching the canonical FFX sample.
     if (ctx.fgContext) {
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = reinterpret_cast<void*>(ctx.fgWrappedSwapchain);
         cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
         cfg.frameGenerationCallbackUserContext = &ctx;
-        cfg.frameGenerationEnabled = ctx.fgPreparedThisFrame;
+        cfg.frameGenerationEnabled = ctx.fgEnabled && ctx.fgPreparedThisFrame;
         cfg.allowAsyncWorkloads = false;
+        cfg.flags = ctx.fgDebugFlags;                       // host debug overlays (tear/pacing lines, debug view)
+        cfg.onlyPresentGenerated = ctx.fgOnlyPresentGenerated;
         cfg.generationRect = { 0, 0, (int32_t)ctx.fgDisplayW, (int32_t)ctx.fgDisplayH };
         cfg.frameID = ctx.frameID;
         ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
@@ -893,9 +958,18 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         return false;
     }
 
-    // Resolve the REAL (un-interposed) device functions for the FFX backend + our barriers, from the
-    // genuine vulkan-1.dll (the interposer self-loads it). Done here (no device work) — safe at startup.
-    if (HMODULE vk = GetModuleHandleW(L"vulkan-1.dll")) {
+    // Resolve the REAL (un-interposed) device functions for the FFX backend + our barriers from the GENUINE
+    // driver loader in System32 — NOT GetModuleHandle("vulkan-1.dll"), which under full interposition IS
+    // sl.interposer.dll. FFX's FrameInterpolationSwapChain creates + presents its swapchain through these
+    // function pointers; routing them to the genuine loader makes the FFX swapchain invisible to the SL
+    // interposer's hook dispatch (so sl.dlss_g's swapchain hook never touches it), which is what lets DLSS-G
+    // and FSR FG coexist and be switched in-game. The interposer already self-loaded this same genuine
+    // module, so LoadLibrary just bumps its refcount.
+    wchar_t sysDir[MAX_PATH]{};
+    std::wstring genuineVkPath = L"vulkan-1.dll";
+    if (GetSystemDirectoryW(sysDir, MAX_PATH))
+        genuineVkPath = std::wstring(sysDir) + L"\\vulkan-1.dll";
+    if (HMODULE vk = LoadLibraryW(genuineVkPath.c_str())) {
         auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(vk, "vkGetInstanceProcAddr")));
         chi::Instance instance{};
         ctx.compute->getInstance(instance);

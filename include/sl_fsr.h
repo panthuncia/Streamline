@@ -67,6 +67,11 @@ SL_STRUCT_BEGIN(FSRFrameGenOptions, StructType({ 0xe4c5d6f7, 0x8091, 0x42a3, { 0
     //! Whether the presented color is HDR + its peak luminance (for FFX tonemap/transfer-function).
     Boolean colorBuffersHDR = Boolean::eFalse;
     float hdrPeakNits = 1000.0f;
+    //! FSR3 frame-generation debug overlays, forwarded to ffxConfigureDescFrameGeneration every present.
+    Boolean debugView = Boolean::eFalse;             //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW
+    Boolean debugTearLines = Boolean::eFalse;        //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES
+    Boolean debugPacingLines = Boolean::eFalse;      //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES
+    Boolean onlyPresentGenerated = Boolean::eFalse;  //! present only generated frames (FFX onlyPresentGenerated)
 SL_STRUCT_END()
 
 //! FSR frame-generation state (mirrors DLSSGState).

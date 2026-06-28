@@ -2076,6 +2076,21 @@ extern "C"
 
     // -- VK_KHR_swapchain --
 
+    // Community Shaders: while the sl.fsr FFX FrameInterpolationSwapChain owns present (FSR FG active —
+    // published by sl.fsr as the "sl.fsr.fgActive" param), SKIP sl.dlss_g's WSI hooks so it never wraps or
+    // touches FFX's swapchain. If both FG plugins handle the same swapchain there are two present owners →
+    // VK_ERROR_DEVICE_LOST. Suppressing ALL of dlss_g's swapchain hooks (not just Create — it also grabs
+    // the swapchain lazily via GetSwapchainImages/AcquireNextImage/Present) is what lets both FG plugins
+    // stay loaded so the user can switch FG method in-game.
+    static inline bool cs_skipDlssgWsiHook(sl::Feature feature)
+    {
+        if (feature != sl::kFeatureDLSS_G)
+            return false;
+        bool fsrFgActive = false;
+        sl::param::getInterface()->get("sl.fsr.fgActive", &fsrFgActive);
+        return fsrFgActive;
+    }
+
     VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfoKHR* CreateInfo, const VkAllocationCallbacks* Allocator, VkSwapchainKHR* Swapchain)
     {
         bool skip = false;
@@ -2084,6 +2099,8 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_CreateSwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
+                if (cs_skipDlssgWsiHook(feature))
+                    continue;
                 result = ((sl::PFunVkCreateSwapchainKHRBefore*)hook)(Device, CreateInfo, Allocator, Swapchain, skip);
                 if (result != VK_SUCCESS)
                 {
@@ -2118,6 +2135,14 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_DestroySwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
+                // NOTE: DestroySwapchainKHR is intentionally NOT suppressed for sl.dlss_g (unlike Create/
+                // GetImages/Acquire/Present). When FSR FG turns on, DXVK destroys the swapchain DLSS-G grabbed
+                // at startup and installs FFX's instead. If DLSS-G never sees that destroy it keeps a stale
+                // swapchain reference and later refuses to create a fresh one ("DLSS-G supports just one
+                // viewport so only one swap-chain can be used") when FSR FG is switched back off — causing a
+                // per-frame recreate storm. Letting the destroy through makes DLSS-G release its reference so
+                // it can cleanly re-wrap once FSR FG releases the swapchain. The destroy hook is a no-op for
+                // any handle that isn't DLSS-G's own, so passing FFX's handle through is harmless.
                 ((sl::PFunVkDestroySwapchainKHRBefore*)hook)(Device, Swapchain, Allocator, skip);
             }
         }
@@ -2136,6 +2161,8 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_GetSwapchainImagesKHR);
             for (auto [hook, feature] : hooks)
             {
+                if (cs_skipDlssgWsiHook(feature))
+                    continue;
                 result = ((sl::PFunVkGetSwapchainImagesKHRBefore*)hook)(Device, Swapchain, SwapchainImageCount, SwapchainImages, skip);
                 if (result != VK_SUCCESS)
                 {
@@ -2159,6 +2186,8 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_AcquireNextImageKHR);
             for (auto [hook, feature] : hooks)
             {
+                if (cs_skipDlssgWsiHook(feature))
+                    continue;
                 result = ((sl::PFunVkAcquireNextImageKHRBefore*)hook)(Device, Swapchain, Timeout, Semaphore, Fence, ImageIndex, skip);
                 // report error on first fail
                 if (result != VK_SUCCESS)
@@ -2184,6 +2213,8 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(hooksId);
             for (auto [hook, feature] : hooks)
             {
+                if (cs_skipDlssgWsiHook(feature))
+                    continue;
                 result = ((sl::PFunVkQueuePresentKHRBefore*)hook)(Queue, PresentInfo, skip);
                 // report error on first fail
                 if (result != VK_SUCCESS)
