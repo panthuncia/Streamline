@@ -1,0 +1,25 @@
+#version 450
+// sl.fsr HUDLessColor format-bridge.
+//
+// FFX's ffxFrameInterpolationContextCreate REQUIRES the HUDLessColor and the backbuffer to be in the
+// same precision group (ffx_frameinterpolation.cpp GetFormatPrecisionGroup). Under HDR the Skyrim
+// backbuffer is R10G10B10A2 (group 6) while the host's hudless scene buffer is RGBA16F (group 1), so the
+// native hudless is rejected and the HUD ghosts on interpolated frames. This copies the hudless 1:1 into
+// an R10G10B10A2 image (the exact backbuffer format the FG context was built with) so FFX accepts it.
+//
+// Source and destination are both at display resolution, so this is a straight per-texel copy (no
+// filtering / resample); the only transformation is the format quantization to 10-bit on store.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uSrc;                       // hudless, RGBA16F
+layout(set = 0, binding = 1, rgb10_a2) uniform writeonly image2D uDst;     // backbuffer-format R10G10B10A2
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(uDst);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+    imageStore(uDst, p, texelFetch(uSrc, p, 0));
+}

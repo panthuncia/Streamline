@@ -31,8 +31,10 @@
 #define TRY(_expr) \
     if (ffxReturnCode_t _rc = (_expr); _rc != FFX_API_RETURN_OK) return _rc
 
+// TRY2: like TRY but for call sites whose expression yields an FFX_OK-domain code (FfxErrorCode)
+// rather than an ffxReturnCode_t. Collapses any non-OK to RUNTIME_ERROR (the FFX-API contract).
 #define TRY2(_expr) \
-    if (FFX_OK != (_expr)) return FFX_API_RETURN_ERROR_RUNTIME_ERROR
+    do { if (FFX_OK != (_expr)) return FFX_API_RETURN_ERROR_RUNTIME_ERROR; } while(0)
 
 struct Allocator
 {

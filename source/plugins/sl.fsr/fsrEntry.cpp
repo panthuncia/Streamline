@@ -36,12 +36,70 @@
 #include "ffx_api/ffx_framegeneration.h"
 #include "ffx_api/vk/ffx_api_vk.h"
 
+// Embedded SPIR-V for the HUDLessColor format bridge (hudless_copy.comp -> SPIR-V via glslangValidator).
+#include "source/plugins/sl.fsr/hudless_copy_spv.h"
+
 using json = nlohmann::json;
 
 namespace sl
 {
 namespace fsr
 {
+// HUDLessColor format bridge: a self-contained compute pass (descriptor set + pipeline + an
+// R10G10B10A2 target image) that copies the host's RGBA16F hudless into the backbuffer format so its
+// FFX precision group matches and FFX accepts it as HUDLessColor under HDR. All VK objects are
+// device-lifetime; the target image is recreated on display-size change. Function pointers are resolved
+// from the GENUINE driver (ctx.realDeviceProcAddr), never through the FFX procaddr shim.
+struct HudlessConvert
+{
+    bool failed = false;
+
+    PFN_vkCreateImage createImage = nullptr;
+    PFN_vkDestroyImage destroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements getImageMemReq = nullptr;
+    PFN_vkAllocateMemory allocateMemory = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    PFN_vkBindImageMemory bindImageMemory = nullptr;
+    PFN_vkCreateImageView createImageView = nullptr;
+    PFN_vkDestroyImageView destroyImageView = nullptr;
+    PFN_vkCreateSampler createSampler = nullptr;
+    PFN_vkDestroySampler destroySampler = nullptr;
+    PFN_vkCreateShaderModule createShaderModule = nullptr;
+    PFN_vkDestroyShaderModule destroyShaderModule = nullptr;
+    PFN_vkCreateDescriptorSetLayout createDescSetLayout = nullptr;
+    PFN_vkDestroyDescriptorSetLayout destroyDescSetLayout = nullptr;
+    PFN_vkCreatePipelineLayout createPipelineLayout = nullptr;
+    PFN_vkDestroyPipelineLayout destroyPipelineLayout = nullptr;
+    PFN_vkCreateComputePipelines createComputePipelines = nullptr;
+    PFN_vkDestroyPipeline destroyPipeline = nullptr;
+    PFN_vkCreateDescriptorPool createDescPool = nullptr;
+    PFN_vkDestroyDescriptorPool destroyDescPool = nullptr;
+    PFN_vkAllocateDescriptorSets allocDescSets = nullptr;
+    PFN_vkUpdateDescriptorSets updateDescSets = nullptr;
+    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets cmdBindDescSets = nullptr;
+    PFN_vkCmdDispatch cmdDispatch = nullptr;
+
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
+    VkDescriptorSet descSet = VK_NULL_HANDLE;
+
+    VkImage dstImage = VK_NULL_HANDLE;
+    VkDeviceMemory dstMemory = VK_NULL_HANDLE;
+    VkImageView dstView = VK_NULL_HANDLE;
+    uint32_t dstW = 0, dstH = 0;
+    VkFormat dstFormat = VK_FORMAT_UNDEFINED;
+
+    VkImage srcImage = VK_NULL_HANDLE;
+    VkImageView srcView = VK_NULL_HANDLE;
+    VkFormat srcFormat = VK_FORMAT_UNDEFINED;
+    bool descDirty = true;
+};
+
 struct FSRContext
 {
     SL_PLUGIN_CONTEXT_CREATE_DESTROY(FSRContext);
@@ -83,9 +141,12 @@ struct FSRContext
     bool fgOnlyPresentGenerated = false;     // present only generated frames (host fgShowOnlyGenerated)
     bool fgGameplayReached = false;          // an upscale has run -> frames are flowing -> safe to install
                                              // the FFX FG swapchain. Building it at cold init / a no-frame
-                                             // loading screen crashes its setup, so the wrap is deferred to
-                                             // here. Latched on; never cleared (the swapchain stays wrapped
-                                             // for the rest of the session, FG on/off is configure-only).
+                                             // loading screen crashes its setup, so the FIRST wrap is deferred
+                                             // to here. Latched on; never cleared. NOTE: the swapchain does NOT
+                                             // stay wrapped for the session — the present hook below
+                                             // bidirectionally recreates via VK_SUBOPTIMAL on `wrapped !=
+                                             // ctx.fgEnabled`, so disabling FSR FG drops the FFX wrapper back to
+                                             // a plain swapchain (no passthrough overhead when FG is off).
     bool fgBootstrapInFlight = false;        // de-bounce the single present->SUBOPTIMAL recreate that
                                              // installs the FFX swapchain the first time gameplay is reached.
     bool fgWrapFailed = false;               // createFgSwapchain failed -> stop retriggering the bootstrap
@@ -98,6 +159,29 @@ struct FSRContext
     ffxQueryDescSwapchainReplacementFunctionsVK fgSwapchainFns{};
     uint32_t fgDisplayW = 0, fgDisplayH = 0, fgRenderW = 0, fgRenderH = 0, fgBackBufferFormat = 0;
     bool fgContextHDR = false;  // the HDR flag the current fgContext was actually built with (vs fgColorHDR desired)
+
+    // HUDLessColor: the scene WITHOUT UI, at display (back-buffer) res, tagged by the host on the FG viewport
+    // every gameplay frame. FFX's FrameInterpolationSwapChain uses it to extract the UI (backbuffer - hudless)
+    // so interpolated frames don't ghost the HUD. fsrEndEvaluation captures the wrapped resource declared in
+    // its CURRENT DXVK layout (NO transition here — it is consumed on FFX's own present cmd, not our evaluate
+    // cmd; FFX transitions from/back to it per its contract, keeping DXVK's layout tracking consistent) and the
+    // present hook feeds it to ffxConfigure. fgHudlessVkFormat (derived from the tagged resource) is baked into
+    // the FG context via the optional hudless create-struct when it differs from the backbuffer (e.g. an
+    // RGBA16F scene buffer vs an RGBA8 backbuffer) — without it FFX subtracts the hudless using the wrong format.
+    FfxApiResource fgHudlessResource{};
+    bool fgHaveHudless = false;
+    bool fgHudlessCompatible = false;   // hudless format is in the SAME FFX precision group as the backbuffer
+    uint32_t fgHudlessVkFormat = 0;     // VkFormat of the host's hudless texture; 0 => assume == backbuffer
+    uint32_t fgCtxHudlessFormat = 0;    // VkFormat the current fgContext was actually built with (recreate on change)
+    VkFormat fgBackBufferVkFormat = VK_FORMAT_UNDEFINED;  // the swapchain's VkFormat (R10G10B10A2 in HDR); the
+                                        // format the hudless bridge targets so it shares the backbuffer group.
+
+    // HUDLessColor format bridge (RGBA16F hudless -> backbuffer-format R10G10B10A2 so FFX accepts it in HDR).
+    HudlessConvert hc;
+    PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties pfnGetFormatProps = nullptr;
+    VkPhysicalDeviceMemoryProperties memProps{};
+    bool memPropsValid = false;
 
     // The three queues FFX's FG swapchain requires. gameQueue is DXVK's own present queue (captured
     // from the first passthrough present); presentQueue/imageAcquireQueue are the two extra graphics
@@ -207,6 +291,36 @@ VkImageLayout ffxStateToLayout(uint32_t state)
             return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         default:
             return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+}
+
+// Route FFX-API internal messages (notably context-creation failures) into the SL log. FFX's providers
+// are otherwise silent — ffxCreateContext just returns a code — so without this we cannot see WHY a FG
+// context fails. Registered globally via ffxConfigure(nullptr, GLOBALDEBUG1) before the FG create.
+static void ffxApiLogMessage(uint32_t type, const wchar_t* message)
+{
+    if (!message)
+        return;
+    char buf[1024] = {};
+    size_t conv = 0;
+    wcstombs_s(&conv, buf, sizeof(buf), message, _TRUNCATE);
+    if (type == FFX_API_MESSAGE_TYPE_ERROR) {
+        SL_LOG_ERROR("sl.fsr: [FFX] %s", buf);
+    } else {
+        SL_LOG_WARN("sl.fsr: [FFX] %s", buf);
+    }
+}
+
+// Inverse of ffxStateToLayout: map a resource's CURRENT VkImageLayout back to an FFX state enum. Used for
+// present-time resources (HUDLessColor) that must be declared to FFX in the layout DXVK already has them in,
+// without recording a transition in our evaluate command buffer.
+uint32_t layoutToFfxState(VkImageLayout layout)
+{
+    switch (layout) {
+        case VK_IMAGE_LAYOUT_GENERAL:              return FFX_API_RESOURCE_STATE_COMMON;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return FFX_API_RESOURCE_STATE_COPY_SRC;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return FFX_API_RESOURCE_STATE_COPY_DEST;
+        default:                                   return FFX_API_RESOURCE_STATE_COMPUTE_READ;
     }
 }
 
@@ -401,13 +515,40 @@ bool acquireFgQueues(fsr::FSRContext& ctx)
     return true;
 }
 
+// Mirror ffx_frameinterpolation.cpp's GetFormatPrecisionGroup over FfxApiSurfaceFormat values. FFX's
+// ffxFrameInterpolationContextCreate rejects (FFX_ERROR_INVALID_ARGUMENT) a HUDLessColor whose format is in a
+// different precision group than the backbuffer, so we use it only when the groups match. -1 = unaccepted.
+static int ffxApiFormatPrecisionGroup(uint32_t fmt)
+{
+    switch (fmt) {
+    case FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS:
+    case FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT:
+    case FFX_API_SURFACE_FORMAT_R32G32B32_FLOAT:        return 0;
+    case FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS:
+    case FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT:     return 1;
+    case FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS:
+    case FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM:
+    case FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS:
+    case FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM:         return 2;
+    case FFX_API_SURFACE_FORMAT_R8G8B8A8_SNORM:         return 3;
+    case FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB:
+    case FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB:          return 4;
+    case FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT:        return 5;
+    case FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS:
+    case FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM:      return 6;
+    case FFX_API_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP:     return 7;
+    default:                                            return -1;
+    }
+}
+
 // Create the interpolation context (separate from the swapchain context; the swapchain drives it via
 // the dispatch callback). Sized to display+maxRender; recreated on size change.
 bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH, uint32_t renderW, uint32_t renderH, uint32_t backBufferFormat)
 {
     if (ctx.fgContext && ctx.fgDisplayW == displayW && ctx.fgDisplayH == displayH &&
         ctx.fgRenderW >= renderW && ctx.fgRenderH >= renderH && ctx.fgBackBufferFormat == backBufferFormat &&
-        ctx.fgContextHDR == ctx.fgColorHDR)  // HDR flag is baked into fgDesc.flags at create -> recreate if it changed
+        ctx.fgContextHDR == ctx.fgColorHDR &&            // HDR flag is baked into fgDesc.flags at create
+        ctx.fgCtxHudlessFormat == ctx.fgHudlessVkFormat)  // hudless format is baked via the hudless create-struct
         return true;
     if (ctx.fgContext) {
         ffxDestroyContextSEH(ctx.ffxApi, &ctx.fgContext);
@@ -433,6 +574,37 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     fgDesc.maxRenderSize = { renderW, renderH };
     fgDesc.backBufferFormat = backBufferFormat;
 
+    // The host's HUDLessColor (the upscaled scene without UI) lets FFX extract the HUD so it isn't ghosted by
+    // interpolation. BUT ffxFrameInterpolationContextCreate REQUIRES the hudless and backbuffer formats to be in
+    // the same "precision group" (ffx_frameinterpolation.cpp GetFormatPrecisionGroup) or it returns
+    // FFX_ERROR_INVALID_ARGUMENT — which is exactly the FSR-FG failure: the hudless is the RGBA16F scene buffer
+    // (group 1) while the HDR backbuffer is R10G10B10A2 (group 6). So only chain + use the hudless when its
+    // precision group matches the backbuffer's; otherwise run with an empty HUDLessColor (as the dev branch did).
+    ffxCreateContextDescFrameGenerationHudless hudlessDesc{};
+    const uint32_t hudlessFormat = ctx.fgHudlessVkFormat ? ffxApiGetSurfaceFormatVK((VkFormat)ctx.fgHudlessVkFormat) : 0;
+    const int hudlessGroup = ffxApiFormatPrecisionGroup(hudlessFormat);
+    const int backBufferGroup = ffxApiFormatPrecisionGroup(backBufferFormat);
+    ctx.fgHudlessCompatible = hudlessFormat && hudlessGroup >= 0 && hudlessGroup == backBufferGroup;
+    if (ctx.fgHudlessCompatible && hudlessFormat != backBufferFormat) {
+        hudlessDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS;
+        hudlessDesc.header.pNext = &backendDesc.header;
+        hudlessDesc.hudlessBackBufferFormat = hudlessFormat;
+        fgDesc.header.pNext = &hudlessDesc.header;  // chain: fgDesc -> hudless -> backend
+        SL_LOG_INFO("sl.fsr: FG context using hudless format %u (backbuffer %u)", hudlessFormat, backBufferFormat);
+    } else if (hudlessFormat && !ctx.fgHudlessCompatible) {
+        SL_LOG_INFO("sl.fsr: hudless format %u (group %d) incompatible with backbuffer %u (group %d) — empty HUDLessColor",
+            hudlessFormat, hudlessGroup, backBufferFormat, backBufferGroup);
+    }
+
+    // Register FFX's global debug message callback so a FG-context-create failure logs WHY (optical-flow /
+    // frame-interpolation pipeline or resource that failed), not just the opaque return code.
+    ffxConfigureDescGlobalDebug1 ffxDbg{};
+    ffxDbg.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+    ffxDbg.fpMessage = &ffxApiLogMessage;
+    ffxDbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE;
+    if (ctx.ffxApi.Configure)
+        ctx.ffxApi.Configure(nullptr, &ffxDbg.header);
+
     ffxReturnCode_t rc = ffxCreateContextSEH(ctx.ffxApi, &ctx.fgContext, &fgDesc.header);
     if (rc != FFX_API_RETURN_OK) {
         SL_LOG_ERROR("sl.fsr: ffxCreateContext(FG) failed 0x%08X", (uint32_t)rc);
@@ -442,6 +614,7 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     ctx.fgDisplayW = displayW; ctx.fgDisplayH = displayH; ctx.fgRenderW = renderW; ctx.fgRenderH = renderH;
     ctx.fgBackBufferFormat = backBufferFormat;
     ctx.fgContextHDR = ctx.fgColorHDR;
+    ctx.fgCtxHudlessFormat = ctx.fgHudlessVkFormat;
     ctx.frameID = 0;
     SL_LOG_INFO("sl.fsr: FFX FG context created (display %ux%u render %ux%u)", displayW, displayH, renderW, renderH);
     return true;
@@ -478,6 +651,7 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     const uint32_t displayW = pCreateInfo->imageExtent.width, displayH = pCreateInfo->imageExtent.height;
     const uint32_t backBufferFormat = ffxApiGetSurfaceFormatVK(pCreateInfo->imageFormat);
     ctx.fgBackBufferFormat = backBufferFormat;
+    ctx.fgBackBufferVkFormat = pCreateInfo->imageFormat;  // target format for the hudless bridge
     // Render size is unknown until the first upscale; size FG to display (FFX clamps maxRenderSize).
     if (!ensureFgContext(ctx, displayW, displayH, displayW, displayH, backBufferFormat))
         return false;
@@ -559,6 +733,287 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     SL_LOG_INFO("sl.fsr: FFX FG swapchain created (%ux%u, wrapped 0x%llX)", displayW, displayH, (unsigned long long)ctx.fgWrappedSwapchain);
     return true;
 }
+
+// ---- HUDLessColor format bridge (RGBA16F hudless -> backbuffer-format R10G10B10A2 via compute) -------
+
+// Resolve the bridge's device functions from the genuine driver. Latches failure so a missing entry
+// disables the bridge (HUD extraction off) rather than retrying every frame.
+bool hcEnsureResolved(fsr::FSRContext& ctx)
+{
+    auto& hc = ctx.hc;
+    if (hc.failed) return false;
+    if (hc.cmdDispatch) return true;
+    if (!ctx.realDeviceProcAddr || ctx.device == VK_NULL_HANDLE) return false;
+    auto R = [&](const char* n) { return ctx.realDeviceProcAddr(ctx.device, n); };
+    hc.createImage            = (PFN_vkCreateImage)R("vkCreateImage");
+    hc.destroyImage           = (PFN_vkDestroyImage)R("vkDestroyImage");
+    hc.getImageMemReq         = (PFN_vkGetImageMemoryRequirements)R("vkGetImageMemoryRequirements");
+    hc.allocateMemory         = (PFN_vkAllocateMemory)R("vkAllocateMemory");
+    hc.freeMemory             = (PFN_vkFreeMemory)R("vkFreeMemory");
+    hc.bindImageMemory        = (PFN_vkBindImageMemory)R("vkBindImageMemory");
+    hc.createImageView        = (PFN_vkCreateImageView)R("vkCreateImageView");
+    hc.destroyImageView       = (PFN_vkDestroyImageView)R("vkDestroyImageView");
+    hc.createSampler          = (PFN_vkCreateSampler)R("vkCreateSampler");
+    hc.destroySampler         = (PFN_vkDestroySampler)R("vkDestroySampler");
+    hc.createShaderModule     = (PFN_vkCreateShaderModule)R("vkCreateShaderModule");
+    hc.destroyShaderModule    = (PFN_vkDestroyShaderModule)R("vkDestroyShaderModule");
+    hc.createDescSetLayout    = (PFN_vkCreateDescriptorSetLayout)R("vkCreateDescriptorSetLayout");
+    hc.destroyDescSetLayout   = (PFN_vkDestroyDescriptorSetLayout)R("vkDestroyDescriptorSetLayout");
+    hc.createPipelineLayout   = (PFN_vkCreatePipelineLayout)R("vkCreatePipelineLayout");
+    hc.destroyPipelineLayout  = (PFN_vkDestroyPipelineLayout)R("vkDestroyPipelineLayout");
+    hc.createComputePipelines = (PFN_vkCreateComputePipelines)R("vkCreateComputePipelines");
+    hc.destroyPipeline        = (PFN_vkDestroyPipeline)R("vkDestroyPipeline");
+    hc.createDescPool         = (PFN_vkCreateDescriptorPool)R("vkCreateDescriptorPool");
+    hc.destroyDescPool        = (PFN_vkDestroyDescriptorPool)R("vkDestroyDescriptorPool");
+    hc.allocDescSets          = (PFN_vkAllocateDescriptorSets)R("vkAllocateDescriptorSets");
+    hc.updateDescSets         = (PFN_vkUpdateDescriptorSets)R("vkUpdateDescriptorSets");
+    hc.cmdBindPipeline        = (PFN_vkCmdBindPipeline)R("vkCmdBindPipeline");
+    hc.cmdBindDescSets        = (PFN_vkCmdBindDescriptorSets)R("vkCmdBindDescriptorSets");
+    hc.cmdDispatch            = (PFN_vkCmdDispatch)R("vkCmdDispatch");
+    const bool ok = hc.createImage && hc.destroyImage && hc.getImageMemReq && hc.allocateMemory &&
+        hc.freeMemory && hc.bindImageMemory && hc.createImageView && hc.destroyImageView && hc.createSampler &&
+        hc.destroySampler && hc.createShaderModule && hc.destroyShaderModule && hc.createDescSetLayout &&
+        hc.destroyDescSetLayout && hc.createPipelineLayout && hc.destroyPipelineLayout &&
+        hc.createComputePipelines && hc.destroyPipeline && hc.createDescPool && hc.destroyDescPool &&
+        hc.allocDescSets && hc.updateDescSets && hc.cmdBindPipeline && hc.cmdBindDescSets && hc.cmdDispatch;
+    if (!ok) {
+        SL_LOG_WARN("sl.fsr: hudless bridge — missing device function(s); HUD extraction disabled");
+        hc.failed = true;
+    }
+    return ok;
+}
+
+// Build the compute pipeline + descriptor set once.
+bool hcEnsurePipeline(fsr::FSRContext& ctx)
+{
+    auto& hc = ctx.hc;
+    if (hc.pipeline != VK_NULL_HANDLE) return true;
+
+    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smci.codeSize = sizeof(g_hudlessCopySpv);
+    smci.pCode = g_hudlessCopySpv;
+    if (hc.createShaderModule(ctx.device, &smci, nullptr, &hc.shader) != VK_SUCCESS) { hc.failed = true; return false; }
+
+    VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = VK_FILTER_NEAREST;
+    sci.minFilter = VK_FILTER_NEAREST;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    hc.createSampler(ctx.device, &sci, nullptr, &hc.sampler);
+
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo slci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    slci.bindingCount = 2; slci.pBindings = b;
+    if (hc.createDescSetLayout(ctx.device, &slci, nullptr, &hc.setLayout) != VK_SUCCESS) { hc.failed = true; return false; }
+
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount = 1; plci.pSetLayouts = &hc.setLayout;
+    if (hc.createPipelineLayout(ctx.device, &plci, nullptr, &hc.pipeLayout) != VK_SUCCESS) { hc.failed = true; return false; }
+
+    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = hc.shader;
+    cpci.stage.pName = "main";
+    cpci.layout = hc.pipeLayout;
+    if (hc.createComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &hc.pipeline) != VK_SUCCESS) {
+        hc.pipeline = VK_NULL_HANDLE; hc.failed = true; return false;
+    }
+
+    VkDescriptorPoolSize ps[2]{};
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 1;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpci.maxSets = 1; dpci.poolSizeCount = 2; dpci.pPoolSizes = ps;
+    if (hc.createDescPool(ctx.device, &dpci, nullptr, &hc.descPool) != VK_SUCCESS) { hc.failed = true; return false; }
+    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dsai.descriptorPool = hc.descPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &hc.setLayout;
+    if (hc.allocDescSets(ctx.device, &dsai, &hc.descSet) != VK_SUCCESS) { hc.failed = true; return false; }
+    return true;
+}
+
+// (Re)create the R10G10B10A2 target image at display resolution. Requires STORAGE_IMAGE support for the
+// backbuffer format (true on NVIDIA/DXVK with shaderStorageImageExtendedFormats); disables the bridge if not.
+bool hcEnsureTarget(fsr::FSRContext& ctx, uint32_t w, uint32_t h, VkFormat fmt)
+{
+    auto& hc = ctx.hc;
+    if (hc.dstImage != VK_NULL_HANDLE && hc.dstW == w && hc.dstH == h && hc.dstFormat == fmt)
+        return true;
+    if (hc.dstView)   { hc.destroyImageView(ctx.device, hc.dstView, nullptr);   hc.dstView = VK_NULL_HANDLE; }
+    if (hc.dstImage)  { hc.destroyImage(ctx.device, hc.dstImage, nullptr);       hc.dstImage = VK_NULL_HANDLE; }
+    if (hc.dstMemory) { hc.freeMemory(ctx.device, hc.dstMemory, nullptr);        hc.dstMemory = VK_NULL_HANDLE; }
+
+    if (ctx.physicalDevice == VK_NULL_HANDLE && ctx.compute) {
+        chi::PhysicalDevice physical{};
+        ctx.compute->getPhysicalDevice(physical);
+        ctx.physicalDevice = (VkPhysicalDevice)physical;
+    }
+    if (ctx.pfnGetFormatProps && ctx.physicalDevice != VK_NULL_HANDLE) {
+        VkFormatProperties fp{};
+        ctx.pfnGetFormatProps(ctx.physicalDevice, fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            SL_LOG_WARN("sl.fsr: hudless bridge — backbuffer format %d lacks STORAGE_IMAGE; HUD extraction disabled", (int)fmt);
+            hc.failed = true; return false;
+        }
+    }
+    if (!ctx.memPropsValid && ctx.pfnGetMemProps && ctx.physicalDevice != VK_NULL_HANDLE) {
+        ctx.pfnGetMemProps(ctx.physicalDevice, &ctx.memProps);
+        ctx.memPropsValid = true;
+    }
+
+    VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = { w, h, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (hc.createImage(ctx.device, &ici, nullptr, &hc.dstImage) != VK_SUCCESS) { hc.dstImage = VK_NULL_HANDLE; hc.failed = true; return false; }
+
+    VkMemoryRequirements mr{};
+    hc.getImageMemReq(ctx.device, hc.dstImage, &mr);
+    uint32_t typeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < ctx.memProps.memoryTypeCount; ++i)
+        if ((mr.memoryTypeBits & (1u << i)) && (ctx.memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { typeIndex = i; break; }
+    if (typeIndex == UINT32_MAX) { SL_LOG_WARN("sl.fsr: hudless bridge — no device-local memory type"); hc.failed = true; return false; }
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = typeIndex;
+    if (hc.allocateMemory(ctx.device, &mai, nullptr, &hc.dstMemory) != VK_SUCCESS) { hc.dstMemory = VK_NULL_HANDLE; hc.failed = true; return false; }
+    hc.bindImageMemory(ctx.device, hc.dstImage, hc.dstMemory, 0);
+
+    VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = hc.dstImage; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (hc.createImageView(ctx.device, &vci, nullptr, &hc.dstView) != VK_SUCCESS) { hc.dstView = VK_NULL_HANDLE; hc.failed = true; return false; }
+
+    hc.dstW = w; hc.dstH = h; hc.dstFormat = fmt; hc.descDirty = true;
+    SL_LOG_INFO("sl.fsr: hudless bridge target %ux%u fmt=%d", w, h, (int)fmt);
+    return true;
+}
+
+// Cache an image view of the host's hudless source; rebuild only when the source image/format changes.
+bool hcEnsureSrcView(fsr::FSRContext& ctx, VkImage src, VkFormat fmt)
+{
+    auto& hc = ctx.hc;
+    if (hc.srcView != VK_NULL_HANDLE && hc.srcImage == src && hc.srcFormat == fmt)
+        return true;
+    if (hc.srcView) { hc.destroyImageView(ctx.device, hc.srcView, nullptr); hc.srcView = VK_NULL_HANDLE; }
+    VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = src; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (hc.createImageView(ctx.device, &vci, nullptr, &hc.srcView) != VK_SUCCESS) { hc.srcView = VK_NULL_HANDLE; return false; }
+    hc.srcImage = src; hc.srcFormat = fmt; hc.descDirty = true;
+    return true;
+}
+
+void hcUpdateDescriptors(fsr::FSRContext& ctx)
+{
+    auto& hc = ctx.hc;
+    VkDescriptorImageInfo srcInfo{};
+    srcInfo.sampler = hc.sampler;
+    srcInfo.imageView = hc.srcView;
+    srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo dstInfo{};
+    dstInfo.imageView = hc.dstView;
+    dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w[2]{};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = hc.descSet; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &srcInfo;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = hc.descSet; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &dstInfo;
+    hc.updateDescSets(ctx.device, 2, w, 0, nullptr);
+    hc.descDirty = false;
+}
+
+// Record the hudless->backbuffer-format copy on the SL evaluate command buffer and point
+// ctx.fgHudlessResource at the converted (FFX-compatible) image. Returns false on any setup failure.
+bool convertHudless(fsr::FSRContext& ctx, VkCommandBuffer cmd, VkImage src, VkFormat srcFmt,
+    VkImageLayout srcLayout, uint32_t w, uint32_t h)
+{
+    auto& hc = ctx.hc;
+    if (ctx.fgBackBufferVkFormat == VK_FORMAT_UNDEFINED || !ctx.vkCmdPipelineBarrier)
+        return false;
+    if (!hcEnsureResolved(ctx) || !hcEnsurePipeline(ctx) ||
+        !hcEnsureTarget(ctx, w, h, ctx.fgBackBufferVkFormat) || !hcEnsureSrcView(ctx, src, srcFmt))
+        return false;
+    if (hc.descDirty)
+        hcUpdateDescriptors(ctx);
+
+    const VkImageSubresourceRange color = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+    VkImageMemoryBarrier pre[2]{};
+    pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    pre[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    pre[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    pre[0].oldLayout = srcLayout;
+    pre[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre[0].image = src; pre[0].subresourceRange = color;
+    pre[1] = pre[0];
+    pre[1].srcAccessMask = 0;
+    pre[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;   // we overwrite every texel; old contents discardable
+    pre[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pre[1].image = hc.dstImage;
+    ctx.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, pre);
+
+    hc.cmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hc.pipeline);
+    hc.cmdBindDescSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hc.pipeLayout, 0, 1, &hc.descSet, 0, nullptr);
+    hc.cmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+
+    VkImageMemoryBarrier post[2]{};
+    post[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    post[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    post[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    post[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    post[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;   // FFX consumes it as COMMON (GENERAL)
+    post[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; post[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    post[0].image = hc.dstImage; post[0].subresourceRange = color;
+    post[1] = post[0];
+    post[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    post[1].dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    post[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    post[1].newLayout = (srcLayout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_IMAGE_LAYOUT_GENERAL : srcLayout;
+    post[1].image = src;
+    ctx.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 0, nullptr, 0, nullptr, 2, post);
+
+    VkImageCreateInfo info{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = ctx.fgBackBufferVkFormat;
+    info.extent = { w, h, 1 };
+    info.mipLevels = 1; info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    FfxApiResourceDescription fdesc = ffxApiGetImageResourceDescriptionVK(hc.dstImage, info, FFX_API_RESOURCE_USAGE_READ_ONLY);
+    ctx.fgHudlessResource = ffxApiGetResourceVK(reinterpret_cast<void*>(hc.dstImage), fdesc, FFX_API_RESOURCE_STATE_COMMON);
+    return true;
+}
+
+// Destroy all bridge VK objects (device-lifetime; called at plugin shutdown).
+void hcDestroy(fsr::FSRContext& ctx)
+{
+    auto& hc = ctx.hc;
+    if (ctx.device == VK_NULL_HANDLE) { hc = {}; return; }
+    if (hc.srcView)    hc.destroyImageView(ctx.device, hc.srcView, nullptr);
+    if (hc.dstView)    hc.destroyImageView(ctx.device, hc.dstView, nullptr);
+    if (hc.dstImage)   hc.destroyImage(ctx.device, hc.dstImage, nullptr);
+    if (hc.dstMemory)  hc.freeMemory(ctx.device, hc.dstMemory, nullptr);
+    if (hc.pipeline)   hc.destroyPipeline(ctx.device, hc.pipeline, nullptr);
+    if (hc.pipeLayout) hc.destroyPipelineLayout(ctx.device, hc.pipeLayout, nullptr);
+    if (hc.setLayout)  hc.destroyDescSetLayout(ctx.device, hc.setLayout, nullptr);
+    if (hc.descPool)   hc.destroyDescPool(ctx.device, hc.descPool, nullptr);
+    if (hc.sampler)    hc.destroySampler(ctx.device, hc.sampler, nullptr);
+    if (hc.shader)     hc.destroyShaderModule(ctx.device, hc.shader, nullptr);
+    hc = {};
+}
 }
 
 sl::Result fsrBeginEvaluation(chi::CommandList /*pCmdList*/, const common::EventData& /*evd*/, const sl::BaseStructure** /*inputs*/, uint32_t /*numInputs*/)
@@ -587,6 +1042,10 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     getTaggedResource(kBufferTypeScalingOutputColor, colorOut, evd.frame, evd.id, true, inputs, numInputs);
     getTaggedResource(kBufferTypeDepth, depth, evd.frame, evd.id, false, inputs, numInputs);
     getTaggedResource(kBufferTypeMotionVectors, mvec, evd.frame, evd.id, false, inputs, numInputs);
+    // HUDLessColor is OPTIONAL and only present on the FG-prepare viewport (the host tags it for FFX UI
+    // extraction). Query it optional so the upscale viewport's absence doesn't spam tag-not-found.
+    CommonResource hudless{};
+    getTaggedResource(kBufferTypeHUDLessColor, hudless, evd.frame, evd.id, true, inputs, numInputs);
     // This single kFeatureFSR evaluate serves two roles, distinguished by what the host tagged:
     //   * color + depth + MV  -> FSR UPSCALE (+ FG-prepare if FG is on and using FSR upscale)
     //   * depth + MV only      -> standalone FG-PREPARE, which the host drives EVERY frame so FSR frame
@@ -610,6 +1069,12 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     // Depth + MV feed both the upscale and the FG-prepare; wrap+transition once and share.
     FfxApiResource depthRes = wrapAndTransition(ctx, cmd, depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET, true, restore);
     FfxApiResource mvecRes = wrapAndTransition(ctx, cmd, mvec, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
+    // The motion-vector resource MUST carry the SAME dimensions/subrect as depth — FFX reconstructs MV against
+    // the depth grid, so a size mismatch (e.g. a full-res MV texture vs a render-res depth) misaligns the
+    // dilation and leaves MV not covering the frame. Force MV's description to depth's so they're sampled
+    // identically (renderSize below already defines the shared valid subrect).
+    mvecRes.description.width = depthRes.description.width;
+    mvecRes.description.height = depthRes.description.height;
     const FfxApiFloatCoords2D motionVectorScale = { (float)renderW, (float)renderH };
     // consts->jitterOffset is ALREADY negated by the host (matching SL/DLSS + FFX's expected -jitter);
     // pass it straight through — negating again was a double-negation that ghosts under motion.
@@ -672,6 +1137,36 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     // dispatch itself only runs once that swapchain (and its FG context) exists.
     if (ctx.fgEnabled) {
         ctx.fgGameplayReached = true;
+
+        // Capture HUDLessColor for present-time UI extraction. NO transition here — FFX consumes it on its own
+        // present command buffer, so we declare it in its CURRENT DXVK layout (FFX transitions from/back to it)
+        // and stash the wrapped resource for the present hook. Also record its format so the FG context bakes
+        // the matching hudless create-struct (see ensureFgContext) before the swapchain is first wrapped.
+        // The FG context was built (createFgSwapchain) expecting hudless in the BACKBUFFER format (fgHudlessVkFormat
+        // was 0 at create -> no hudless create-struct chained). So if the host's hudless is already that format, feed
+        // it directly; otherwise (HDR: RGBA16F scene vs R10G10B10A2 backbuffer) bridge it through the compute copy so
+        // its precision group matches and FFX accepts it for HUD extraction instead of dropping it.
+        ctx.fgHaveHudless = false;
+        ctx.fgHudlessCompatible = false;
+        if (chi::Resource hres = hudless; hres && hres->native) {
+            chi::ResourceDescription hdesc{};
+            ctx.compute->getResourceDescription(hres, hdesc);
+            VkImage himage = (VkImage)hres->native;
+            const VkFormat hfmt = (VkFormat)hdesc.nativeFormat;
+            if (ctx.fgBackBufferVkFormat != VK_FORMAT_UNDEFINED && hfmt == ctx.fgBackBufferVkFormat) {
+                VkImageCreateInfo hinfo = imageInfoFromDesc(hdesc);
+                FfxApiResourceDescription hfdesc = ffxApiGetImageResourceDescriptionVK(himage, hinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
+                ctx.fgHudlessResource = ffxApiGetResourceVK(reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
+                ctx.fgHudlessVkFormat = hfmt;
+                ctx.fgHudlessCompatible = true;
+                ctx.fgHaveHudless = true;
+            } else if (convertHudless(ctx, cmd, himage, hfmt, (VkImageLayout)hres->state, hdesc.width, hdesc.height)) {
+                ctx.fgHudlessVkFormat = ctx.fgBackBufferVkFormat;  // bridged image is now the backbuffer format
+                ctx.fgHudlessCompatible = true;
+                ctx.fgHaveHudless = true;
+            }
+        }
+
         if (ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
             ffxDispatchDescFrameGenerationPrepare prep{};
             prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
@@ -918,6 +1413,12 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         cfg.flags = ctx.fgDebugFlags;                       // host debug overlays (tear/pacing lines, debug view)
         cfg.onlyPresentGenerated = ctx.fgOnlyPresentGenerated;
         cfg.generationRect = { 0, 0, (int32_t)ctx.fgDisplayW, (int32_t)ctx.fgDisplayH };
+        // HUDLessColor: the scene without UI, captured this frame in fsrEndEvaluation. With it, FFX extracts the
+        // UI (backbuffer - hudless) and only interpolates the scene, so the HUD doesn't ghost. Only pass it when
+        // the FG context was built with a compatible hudless format (same precision group as the backbuffer) —
+        // otherwise FFX would read it with the wrong format; empty HUDLessColor in that case (e.g. HDR).
+        if (ctx.fgHaveHudless && ctx.fgHudlessCompatible)
+            cfg.HUDLessColor = ctx.fgHudlessResource;
         cfg.frameID = ctx.frameID;
         ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
     }
@@ -974,6 +1475,9 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         chi::Instance instance{};
         ctx.compute->getInstance(instance);
         if (gipa) {
+            // Instance-level functions for the hudless bridge (physical-device memory + format queries).
+            ctx.pfnGetMemProps = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(reinterpret_cast<void*>(gipa((VkInstance)instance, "vkGetPhysicalDeviceMemoryProperties")));
+            ctx.pfnGetFormatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(reinterpret_cast<void*>(gipa((VkInstance)instance, "vkGetPhysicalDeviceFormatProperties")));
             ctx.realDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa((VkInstance)instance, "vkGetDeviceProcAddr"));
             chi::Device dev{};
             ctx.compute->getDevice(dev);
@@ -994,6 +1498,7 @@ void slOnPluginShutdown()
 {
     auto& ctx = (*fsr::getContext());
     destroyFgSwapchain(ctx);
+    hcDestroy(ctx);
     if (ctx.fgContext && ctx.ffxApi.DestroyContext)
         ctx.ffxApi.DestroyContext(&ctx.fgContext, nullptr);
     ctx.fgContext = nullptr;
