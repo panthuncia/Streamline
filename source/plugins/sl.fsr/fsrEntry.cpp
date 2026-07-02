@@ -473,12 +473,25 @@ FfxApiResource wrapAndTransition(fsr::FSRContext& ctx, VkCommandBuffer cmd, Comm
 
 // ====================== Frame generation (FFX FrameInterpolationSwapChainVK) =====================
 
+// Serializes ALL ffxDispatch calls on the FG context. The FG-prepare dispatches on the game's
+// render thread (inside slEvaluateFeature) while the interpolation dispatch runs on DXVK's submit
+// thread (present -> FFX queuePresent -> FfxFrameGenDispatchCallback) — TWO threads driving ONE
+// FFX context. FFX has no internal lock on this edge and mutates non-atomic per-context state on
+// every dispatch (dynamic-resource/descriptor index allocators, barrier scratch arrays, the
+// backend GPU-job list), so a concurrent prepare + generate corrupts descriptors / the command
+// stream -> sporadic VK_ERROR_DEVICE_LOST minutes into steady frame generation. AMD's samples
+// never hit this because they present on the game thread (prepare and callback are naturally
+// same-thread); DXVK presenting from its submit thread created the concurrency. Leaf mutex:
+// nothing else is locked while held.
+std::mutex g_fgDispatchMutex;
+
 // FFX's swapchain calls this per generated frame to run the interpolation dispatch on our FG context.
 ffxReturnCode_t FfxFrameGenDispatchCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx)
 {
     auto* ctx = reinterpret_cast<fsr::FSRContext*>(pUserCtx);
     if (!ctx || !ctx->fgContext)
         return FFX_API_RETURN_ERROR;
+    std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
     return ffxDispatchSEH(ctx->ffxApi, &ctx->fgContext, &params->header);
 }
 
@@ -568,6 +581,9 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
         ctx.fgCtxHudlessFormat == ctx.fgHudlessVkFormat)  // hudless format is baked via the hudless create-struct
         return true;
     if (ctx.fgContext) {
+        // Wait out any in-flight prepare/interpolation dispatch before destroying the
+        // context it runs on (render thread vs present thread; see g_fgDispatchMutex).
+        std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
         ffxDestroyContextSEH(ctx.ffxApi, &ctx.fgContext);
         ctx.fgContext = nullptr;
     }
@@ -1221,7 +1237,12 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             prep.viewSpaceToMetersFactor = 0.01428222656f;
             prep.depth = depthRes;
             prep.motionVectors = mvecRes;
-            ctx.fgPreparedThisFrame = (ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK);
+            {
+                // Render thread; races the present-thread interpolation dispatch on the same
+                // FG context without this lock (see g_fgDispatchMutex).
+                std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
+                ctx.fgPreparedThisFrame = (ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK);
+            }
         }
     }
 
