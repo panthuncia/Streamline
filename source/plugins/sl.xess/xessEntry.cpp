@@ -26,7 +26,7 @@
 #include "include/sl_xess.h"
 
 // Intel XeSS public headers (xess.h / xess_vk.h; libxess.dll resolved at runtime). XeSS now lives inside
-// the fork under external/xess-sdk.
+// the external/xess submodule (github.com/intel/xess @ v2.1.1, matches shipped libxess 2.0.2.68).
 #define XESS_TYPES_ONLY
 #include "xess/xess.h"
 #undef XESS_TYPES_ONLY

@@ -605,7 +605,7 @@ project "sl.xess"
 
 	-- Intel XeSS public headers (xess.h / xess_vk.h; libxess.dll resolved at runtime). XeSS now lives
 	-- inside the fork; CS no longer references it directly.
-	includedirs { "./external/xess-sdk/include" }
+	includedirs { "./external/xess/inc" }
 
 	files {
 		"./source/plugins/sl.xess/**.json",

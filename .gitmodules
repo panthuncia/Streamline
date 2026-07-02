@@ -1,0 +1,8 @@
+[submodule "external/fidelityfx-sdk"]
+	path = external/fidelityfx-sdk
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	shallow = true
+[submodule "external/xess"]
+	path = external/xess
+	url = https://github.com/intel/xess.git
+	shallow = true
