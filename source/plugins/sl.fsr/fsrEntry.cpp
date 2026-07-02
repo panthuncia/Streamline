@@ -41,6 +41,17 @@
 
 using json = nlohmann::json;
 
+// Depth-convention experiment toggles (read once per process). Skyrim's depth is
+// standard [0=near .. 1=far] and is declared as such by default; setting
+// CS_FSR_FG_DEPTH_INVERTED=1 / CS_FSR_UPSCALE_DEPTH_INVERTED=1 declares the input
+// inverted instead, for A/B validation via the FG debug view without a rebuild.
+// FFX min/max-normalizes cameraNear/cameraFar internally, so no swap is needed.
+static bool envFlag(const char* name)
+{
+    char buf[8]{};
+    return GetEnvironmentVariableA(name, buf, sizeof(buf)) > 0 && buf[0] == '1';
+}
+
 namespace sl
 {
 namespace fsr
@@ -152,6 +163,7 @@ struct FSRContext
     bool fgWrapFailed = false;               // createFgSwapchain failed -> stop retriggering the bootstrap
                                              // (else present->recreate->fail loops every frame).
     uint64_t frameID = 0;
+    int64_t fgLastPrepareQpc = 0;            // QPC of the last FG-prepare, for real frameTimeDelta
     PFN_vkQueuePresentKHR realQueuePresentKHR = nullptr;
     ffxContext fgContext = nullptr;          // interpolation context (ffxCreateContextDescFrameGeneration)
     ffxContext fgSwapchainContext = nullptr; // swapchain-replacement context (FGSWAPCHAIN_VK)
@@ -417,6 +429,11 @@ bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t rende
     upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     upscaleDesc.header.pNext = &backendDesc.header;
     upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    static const bool upscaleDepthInverted = envFlag("CS_FSR_UPSCALE_DEPTH_INVERTED");
+    if (upscaleDepthInverted) {
+        upscaleDesc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+        SL_LOG_INFO("sl.fsr: upscale context declaring INVERTED depth (CS_FSR_UPSCALE_DEPTH_INVERTED)");
+    }
     upscaleDesc.maxRenderSize = { renderW, renderH };
     upscaleDesc.maxUpscaleSize = { displayW, displayH };
     upscaleDesc.fpMessage = nullptr;
@@ -570,6 +587,11 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     fgDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
     fgDesc.header.pNext = &backendDesc.header;
     fgDesc.flags = ctx.fgColorHDR ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
+    static const bool fgDepthInverted = envFlag("CS_FSR_FG_DEPTH_INVERTED");
+    if (fgDepthInverted) {
+        fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
+        SL_LOG_INFO("sl.fsr: FG context declaring INVERTED depth (CS_FSR_FG_DEPTH_INVERTED)");
+    }
     fgDesc.displaySize = { displayW, displayH };
     fgDesc.maxRenderSize = { renderW, renderH };
     fgDesc.backBufferFormat = backBufferFormat;
@@ -1176,7 +1198,22 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             prep.renderSize = { renderW, renderH };
             prep.jitterOffset = jitterOffset;
             prep.motionVectorScale = motionVectorScale;
-            prep.frameTimeDelta = 16.6f;
+            // Real frame delta (QPC between prepares), not a hardcoded 60Hz value:
+            // FFX scales its motion field by this, so at uncapped/high FPS a wrong
+            // constant mis-scales interpolation motion.
+            {
+                LARGE_INTEGER qpcNow;
+                QueryPerformanceCounter(&qpcNow);
+                float deltaMs = 16.6f;
+                if (ctx.fgLastPrepareQpc) {
+                    LARGE_INTEGER qpcFreq;
+                    QueryPerformanceFrequency(&qpcFreq);
+                    const double ms = double(qpcNow.QuadPart - ctx.fgLastPrepareQpc) * 1000.0 / double(qpcFreq.QuadPart);
+                    deltaMs = (float)std::min(std::max(ms, 1.0), 100.0);
+                }
+                ctx.fgLastPrepareQpc = qpcNow.QuadPart;
+                prep.frameTimeDelta = deltaMs;
+            }
             prep.unused_reset = false;
             prep.cameraNear = consts->cameraNear;
             prep.cameraFar = consts->cameraFar;
