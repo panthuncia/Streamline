@@ -1,7 +1,7 @@
 /*
 * Community Shaders sl.fsr plugin — public host API.
 *
-* AMD FidelityFX FSR3 upscaling (kFeatureFSR) + frame generation (kFeatureFSR_G), driven through the
+* AMD FidelityFX FSR3 upscaling + frame generation (both under kFeatureFSR), driven through the
 * same Streamline interposer as DLSS / DLSS-G. The host tags inputs (slSetTagForFrame) + sets common
 * constants (slSetConstants) and calls slEvaluateFeature(kFeatureFSR, ...) exactly like the DLSS path;
 * frame generation is enabled via slFSRFrameGenerationSetOptions and inserted at the present hook.

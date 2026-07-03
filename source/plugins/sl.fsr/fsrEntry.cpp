@@ -42,73 +42,6 @@
 
 using json = nlohmann::json;
 
-// Depth-convention experiment toggles (read once per process). Skyrim's depth is
-// standard [0=near .. 1=far] and is declared as such by default; setting
-// CS_FSR_FG_DEPTH_INVERTED=1 / CS_FSR_UPSCALE_DEPTH_INVERTED=1 declares the input
-// inverted instead, for A/B validation via the FG debug view without a rebuild.
-// FFX min/max-normalizes cameraNear/cameraFar internally, so no swap is needed.
-static bool envFlag(const char* name)
-{
-    char buf[8]{};
-    return GetEnvironmentVariableA(name, buf, sizeof(buf)) > 0 && buf[0] == '1';
-}
-
-// Numeric env overrides for the FSR-FG tuning A/B sweep. Empty/unset -> fallback.
-static float envFloat(const char* name, float fallback)
-{
-    char buf[32]{};
-    if (GetEnvironmentVariableA(name, buf, sizeof(buf)) == 0 || buf[0] == '\0')
-        return fallback;
-    return (float)atof(buf);
-}
-static uint32_t envUint(const char* name, uint32_t fallback)
-{
-    char buf[32]{};
-    if (GetEnvironmentVariableA(name, buf, sizeof(buf)) == 0 || buf[0] == '\0')
-        return fallback;
-    return (uint32_t)strtoul(buf, nullptr, 10);
-}
-
-// FSR-FG tuning knobs, read ONCE at first use (not per-frame). These map to the FFX FG-swapchain
-// frame-pacing tuning + the async/compose options. safetyMargin/varianceFactor are honored by the
-// current prebuilt amd_fidelityfx_vk.dll (they shift the pacing algorithm's target frametime).
-// The hybrid-spin fields (allowHybridSpin/hybridSpinTime/allowWaitForSingleObjectOnFence) are
-// pre-wired but a VERIFIED NO-OP on the current prebuilt VK backend: it implements hybrid-spin only
-// for DX12 (its VK waitForPerformanceCount busy-spins unconditionally and its setFramePacingTuning
-// reads only safetyMargin+variance). Measured: CS_FSR_FG_HYBRID_SPIN=1 left SkyrimSE CPU unchanged
-// (2.09 vs 2.15 cores). They would only take effect after rebuilding amd_fidelityfx_vk.dll with the
-// VK hybrid-spin port (blocked: FFX VK build requires Vulkan SDK >= 1.3.250). Defaults match FFX's
-// own (safety 0.1ms, variance 0.1); async/compose off. Tune safety/variance only with a frametime
-// tool (PresentMon/OCAT) — average FPS does not reflect pacing variance. A/B via CS_FSR_FG_* env vars.
-struct CsFgTuning
-{
-    bool     asyncWorkloads;
-    bool     composeOnPresentQueue;
-    float    safetyMarginInMs;
-    float    varianceFactor;
-    bool     allowHybridSpin;
-    uint32_t hybridSpinTime;
-    bool     allowWaitForSingleObjectOnFence;
-};
-static const CsFgTuning& csFgTuning()
-{
-    static const CsFgTuning t = [] {
-        CsFgTuning x{};
-        x.asyncWorkloads                  = envFlag("CS_FSR_FG_ASYNC");
-        x.composeOnPresentQueue           = envFlag("CS_FSR_FG_COMPOSE_PRESENT_QUEUE");
-        x.safetyMarginInMs                = envFloat("CS_FSR_FG_SAFETY_MARGIN_MS", 0.1f);
-        x.varianceFactor                  = envFloat("CS_FSR_FG_VARIANCE_FACTOR", 0.1f);
-        x.allowHybridSpin                 = envFlag("CS_FSR_FG_HYBRID_SPIN");
-        x.hybridSpinTime                  = envUint("CS_FSR_FG_HYBRID_SPIN_TIME", 2);
-        x.allowWaitForSingleObjectOnFence = envFlag("CS_FSR_FG_WAIT_FENCE");
-        SL_LOG_INFO("sl.fsr: FG tuning async=%d compose=%d safety=%.3fms variance=%.3f hybridSpin=%d spinTime=%u waitFence=%d",
-            (int)x.asyncWorkloads, (int)x.composeOnPresentQueue, x.safetyMarginInMs, x.varianceFactor,
-            (int)x.allowHybridSpin, x.hybridSpinTime, (int)x.allowWaitForSingleObjectOnFence);
-        return x;
-    }();
-    return t;
-}
-
 namespace sl
 {
 namespace fsr
@@ -192,7 +125,6 @@ struct FSRContext
 
     std::mutex optionsMutex;
     std::map<uint32_t, FSROptions> upscaleOptions;
-    std::map<uint32_t, FSRFrameGenOptions> fgOptions;
 
     // --- Frame generation (FFX FrameInterpolationSwapChainVK proxy) -----------------------------
     // DXVK's swapchain is ALWAYS replaced with an FFX FrameInterpolationSwapChain in the
@@ -274,6 +206,10 @@ SL_PLUGIN_DEFINE("sl.fsr", Version(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH),
 
 namespace
 {
+// Skyrim world units -> meters, for FFX's depth-based reactive/reprojection heuristics (~70 units/m).
+// Shared by the upscale and FG-prepare dispatches so both describe the scene at the same scale.
+constexpr float kSkyrimViewSpaceToMeters = 0.01428222656f;
+
 // --- DXVK ⇄ unmodified prebuilt-FFX VK backend shim (ported from CS FidelityFX.cpp) -------------
 // The stock amd_fidelityfx_vk.dll calls two functions that resolve to NULL on DXVK without null-checks:
 //   vkGetBufferMemoryRequirements2KHR (DXVK promoted it to core, dropped the KHR alias) and
@@ -486,12 +422,8 @@ bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t rende
     ffxCreateContextDescUpscale upscaleDesc{};
     upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     upscaleDesc.header.pNext = &backendDesc.header;
+    // Skyrim's depth is standard [0=near .. 1=far], not reversed-Z, so no FFX_UPSCALE_ENABLE_DEPTH_INVERTED.
     upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
-    static const bool upscaleDepthInverted = envFlag("CS_FSR_UPSCALE_DEPTH_INVERTED");
-    if (upscaleDepthInverted) {
-        upscaleDesc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-        SL_LOG_INFO("sl.fsr: upscale context declaring INVERTED depth (CS_FSR_UPSCALE_DEPTH_INVERTED)");
-    }
     upscaleDesc.maxRenderSize = { renderW, renderH };
     upscaleDesc.maxUpscaleSize = { displayW, displayH };
     upscaleDesc.fpMessage = nullptr;
@@ -568,7 +500,7 @@ bool acquireFgQueues(fsr::FSRContext& ctx)
     // pulls SL's bundled Vulkan headers, which would clash with the FFX ones here) by mirroring only
     // the stable POD head — field order matches layer.h exactly (device, instance, 2 procAddrs, then
     // compute*, then graphics*). graphicsQueueIndex = the start index of the injected extra queues
-    // (wrapper.cpp:900); graphicsQueueFamily = their family.
+    // (set by the interposer's vkCreateDevice wrapper); graphicsQueueFamily = their family.
     struct VkTableHead {
         VkDevice device;
         VkInstance instance;
@@ -661,14 +593,8 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     fgDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
     fgDesc.header.pNext = &backendDesc.header;
     fgDesc.flags = ctx.fgColorHDR ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
-    // Async-compute support must be baked in at context create for allowAsyncWorkloads to take effect.
-    if (csFgTuning().asyncWorkloads)
-        fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
-    static const bool fgDepthInverted = envFlag("CS_FSR_FG_DEPTH_INVERTED");
-    if (fgDepthInverted) {
-        fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
-        SL_LOG_INFO("sl.fsr: FG context declaring INVERTED depth (CS_FSR_FG_DEPTH_INVERTED)");
-    }
+    // Async-compute workloads are disabled (frame generation runs on the game queue).
+    // Skyrim's depth is standard [0=near .. 1=far], not reversed-Z, so no FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED.
     fgDesc.displaySize = { displayW, displayH };
     fgDesc.maxRenderSize = { renderW, renderH };
     fgDesc.backBufferFormat = backBufferFormat;
@@ -700,7 +626,7 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     ffxConfigureDescGlobalDebug1 ffxDbg{};
     ffxDbg.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
     ffxDbg.fpMessage = &ffxApiLogMessage;
-    ffxDbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE;
+    ffxDbg.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
     if (ctx.ffxApi.Configure)
         ctx.ffxApi.Configure(nullptr, &ffxDbg.header);
 
@@ -774,7 +700,7 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     ffxCreateContextDescFrameGenerationSwapChainModeVK mode{};
     mode.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_MODE_VK;
     mode.header.pNext = nullptr;
-    mode.composeOnPresentQueue = csFgTuning().composeOnPresentQueue;
+    mode.composeOnPresentQueue = false;  // compose on the game queue (FFX default)
 
     ffxCreateContextDescFrameGenerationSwapChainVK desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
@@ -824,33 +750,26 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
     cfg.frameGenerationCallbackUserContext = &ctx;
     cfg.frameGenerationEnabled = false;
-    cfg.allowAsyncWorkloads = csFgTuning().asyncWorkloads;
+    cfg.allowAsyncWorkloads = false;
     cfg.generationRect = { 0, 0, (int32_t)displayW, (int32_t)displayH };
     cfg.frameID = ctx.frameID;
     ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
 
     // Frame-pacing tuning on the FG SWAPCHAIN context (distinct from the FG interpolation context above).
-    // safetyMargin/varianceFactor shift the pacing algorithm's target frametime (lower => recovers toward
-    // the true framerate faster after a complexity spike, at the cost of higher variance). The hybrid-spin
-    // fields are consumed only once amd_fidelityfx_vk.dll is rebuilt with the VK hybrid-spin port; harmless
-    // on the current prebuilt DLL (its setFramePacingTuning reads only safetyMargin+variance).
+    // safetyMargin/varianceFactor shift the pacing algorithm's target frametime; set to FFX's own
+    // defaults (0.1ms / 0.1) explicitly.
     {
-        const auto& tune = csFgTuning();
         FfxApiSwapchainFramePacingTuning pacing{};
-        pacing.safetyMarginInMs                = tune.safetyMarginInMs;
-        pacing.varianceFactor                  = tune.varianceFactor;
-        pacing.allowHybridSpin                 = tune.allowHybridSpin;
-        pacing.hybridSpinTime                  = tune.hybridSpinTime;
-        pacing.allowWaitForSingleObjectOnFence = tune.allowWaitForSingleObjectOnFence;
+        pacing.safetyMarginInMs = 0.1f;
+        pacing.varianceFactor   = 0.1f;
         ffxConfigureDescFrameGenerationSwapChainKeyValueVK kv{};
         kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
         kv.header.pNext = nullptr;
         kv.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
         kv.ptr = &pacing;
         ffxReturnCode_t prc = ffxConfigureSEH(ctx.ffxApi, &ctx.fgSwapchainContext, &kv.header);
-        SL_LOG_INFO("sl.fsr: FG frame-pacing tuning (rc=0x%08X safety=%.3fms variance=%.3f hybridSpin=%d spinTime=%u waitFence=%d)",
-            (uint32_t)prc, pacing.safetyMarginInMs, pacing.varianceFactor,
-            (int)pacing.allowHybridSpin, pacing.hybridSpinTime, (int)pacing.allowWaitForSingleObjectOnFence);
+        SL_LOG_INFO("sl.fsr: FG frame-pacing tuning (rc=0x%08X safety=%.3fms variance=%.3f)",
+            (uint32_t)prc, pacing.safetyMarginInMs, pacing.varianceFactor);
     }
 
     SL_LOG_INFO("sl.fsr: FFX FG swapchain created (%ux%u, wrapped 0x%llX)", displayW, displayH, (unsigned long long)ctx.fgWrappedSwapchain);
@@ -1255,7 +1174,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
         dp.enableSharpening = sharpness > 0.0f;
         dp.sharpness = sharpness;
         dp.cameraFovAngleVertical = consts->cameraFOV;
-        dp.viewSpaceToMetersFactor = 0.01428222656f;
+        dp.viewSpaceToMetersFactor = kSkyrimViewSpaceToMeters;
         // Honor the host's camera-cut/reset signal (teleport, fast-travel, menu->game) so FSR flushes its
         // temporal history for one frame instead of smearing the discontinuity.
         dp.reset = (consts->reset == Boolean::eTrue);
@@ -1335,7 +1254,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             prep.cameraNear = consts->cameraNear;
             prep.cameraFar = consts->cameraFar;
             prep.cameraFovAngleVertical = consts->cameraFOV;
-            prep.viewSpaceToMetersFactor = 0.01428222656f;
+            prep.viewSpaceToMetersFactor = kSkyrimViewSpaceToMeters;
             prep.depth = depthRes;
             prep.motionVectors = mvecRes;
             {
@@ -1391,7 +1310,6 @@ sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, co
 {
     auto& ctx = (*fsr::getContext());
     std::lock_guard<std::mutex> lock(ctx.optionsMutex);
-    ctx.fgOptions[(uint32_t)viewport] = options;
     const bool want = options.enabled == Boolean::eTrue;
     if (want != ctx.fgEnabled) {
         // A real on/off edge: let the present hook (re)trigger the wrap/unwrap recreate this frame.
@@ -1568,7 +1486,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
         cfg.frameGenerationCallbackUserContext = &ctx;
         cfg.frameGenerationEnabled = ctx.fgEnabled && ctx.fgPreparedThisFrame;
-        cfg.allowAsyncWorkloads = csFgTuning().asyncWorkloads;
+        cfg.allowAsyncWorkloads = false;
         cfg.flags = ctx.fgDebugFlags;                       // host debug overlays (tear/pacing lines, debug view)
         cfg.onlyPresentGenerated = ctx.fgOnlyPresentGenerated;
         cfg.generationRect = { 0, 0, (int32_t)ctx.fgDisplayW, (int32_t)ctx.fgDisplayH };
@@ -1687,8 +1605,8 @@ void updateEmbeddedJSON(json& config)
         info.minGPUArchitecture = 0;
         updateCommonEmbeddedJSONConfig(&config, info);
     }
-    // Request 2 EXTRA graphics-family queues from the interposer's vkCreateDevice (wrapper.cpp:357-360
-    // sums this over loaded plugins' configs). FFX's FrameInterpolationSwapChain needs distinct
+    // Request 2 EXTRA graphics-family queues from the interposer's vkCreateDevice (which sums this
+    // over loaded plugins' configs). FFX's FrameInterpolationSwapChain needs distinct
     // present + image-acquire queues, exclusive of DXVK's own. Set AFTER updateCommonEmbeddedJSONConfig
     // so it isn't overwritten; the plugin reads the injected family/start-index back from kVulkanTable.
     config["external"]["vk"]["device"]["queues"]["graphics"]["count"] = 2;
