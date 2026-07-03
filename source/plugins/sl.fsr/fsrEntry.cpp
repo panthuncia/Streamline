@@ -8,6 +8,7 @@
 */
 
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -50,6 +51,62 @@ static bool envFlag(const char* name)
 {
     char buf[8]{};
     return GetEnvironmentVariableA(name, buf, sizeof(buf)) > 0 && buf[0] == '1';
+}
+
+// Numeric env overrides for the FSR-FG tuning A/B sweep. Empty/unset -> fallback.
+static float envFloat(const char* name, float fallback)
+{
+    char buf[32]{};
+    if (GetEnvironmentVariableA(name, buf, sizeof(buf)) == 0 || buf[0] == '\0')
+        return fallback;
+    return (float)atof(buf);
+}
+static uint32_t envUint(const char* name, uint32_t fallback)
+{
+    char buf[32]{};
+    if (GetEnvironmentVariableA(name, buf, sizeof(buf)) == 0 || buf[0] == '\0')
+        return fallback;
+    return (uint32_t)strtoul(buf, nullptr, 10);
+}
+
+// FSR-FG tuning knobs, read ONCE at first use (not per-frame). These map to the FFX FG-swapchain
+// frame-pacing tuning + the async/compose options. safetyMargin/varianceFactor are honored by the
+// current prebuilt amd_fidelityfx_vk.dll (they shift the pacing algorithm's target frametime).
+// The hybrid-spin fields (allowHybridSpin/hybridSpinTime/allowWaitForSingleObjectOnFence) are
+// pre-wired but a VERIFIED NO-OP on the current prebuilt VK backend: it implements hybrid-spin only
+// for DX12 (its VK waitForPerformanceCount busy-spins unconditionally and its setFramePacingTuning
+// reads only safetyMargin+variance). Measured: CS_FSR_FG_HYBRID_SPIN=1 left SkyrimSE CPU unchanged
+// (2.09 vs 2.15 cores). They would only take effect after rebuilding amd_fidelityfx_vk.dll with the
+// VK hybrid-spin port (blocked: FFX VK build requires Vulkan SDK >= 1.3.250). Defaults match FFX's
+// own (safety 0.1ms, variance 0.1); async/compose off. Tune safety/variance only with a frametime
+// tool (PresentMon/OCAT) — average FPS does not reflect pacing variance. A/B via CS_FSR_FG_* env vars.
+struct CsFgTuning
+{
+    bool     asyncWorkloads;
+    bool     composeOnPresentQueue;
+    float    safetyMarginInMs;
+    float    varianceFactor;
+    bool     allowHybridSpin;
+    uint32_t hybridSpinTime;
+    bool     allowWaitForSingleObjectOnFence;
+};
+static const CsFgTuning& csFgTuning()
+{
+    static const CsFgTuning t = [] {
+        CsFgTuning x{};
+        x.asyncWorkloads                  = envFlag("CS_FSR_FG_ASYNC");
+        x.composeOnPresentQueue           = envFlag("CS_FSR_FG_COMPOSE_PRESENT_QUEUE");
+        x.safetyMarginInMs                = envFloat("CS_FSR_FG_SAFETY_MARGIN_MS", 0.1f);
+        x.varianceFactor                  = envFloat("CS_FSR_FG_VARIANCE_FACTOR", 0.1f);
+        x.allowHybridSpin                 = envFlag("CS_FSR_FG_HYBRID_SPIN");
+        x.hybridSpinTime                  = envUint("CS_FSR_FG_HYBRID_SPIN_TIME", 2);
+        x.allowWaitForSingleObjectOnFence = envFlag("CS_FSR_FG_WAIT_FENCE");
+        SL_LOG_INFO("sl.fsr: FG tuning async=%d compose=%d safety=%.3fms variance=%.3f hybridSpin=%d spinTime=%u waitFence=%d",
+            (int)x.asyncWorkloads, (int)x.composeOnPresentQueue, x.safetyMarginInMs, x.varianceFactor,
+            (int)x.allowHybridSpin, x.hybridSpinTime, (int)x.allowWaitForSingleObjectOnFence);
+        return x;
+    }();
+    return t;
 }
 
 namespace sl
@@ -164,6 +221,7 @@ struct FSRContext
                                              // (else present->recreate->fail loops every frame).
     uint64_t frameID = 0;
     int64_t fgLastPrepareQpc = 0;            // QPC of the last FG-prepare, for real frameTimeDelta
+    int64_t upscaleLastQpc = 0;              // QPC of the last upscale dispatch, for real frameTimeDelta
     PFN_vkQueuePresentKHR realQueuePresentKHR = nullptr;
     ffxContext fgContext = nullptr;          // interpolation context (ffxCreateContextDescFrameGeneration)
     ffxContext fgSwapchainContext = nullptr; // swapchain-replacement context (FGSWAPCHAIN_VK)
@@ -603,6 +661,9 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     fgDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
     fgDesc.header.pNext = &backendDesc.header;
     fgDesc.flags = ctx.fgColorHDR ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
+    // Async-compute support must be baked in at context create for allowAsyncWorkloads to take effect.
+    if (csFgTuning().asyncWorkloads)
+        fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
     static const bool fgDepthInverted = envFlag("CS_FSR_FG_DEPTH_INVERTED");
     if (fgDepthInverted) {
         fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
@@ -713,7 +774,7 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     ffxCreateContextDescFrameGenerationSwapChainModeVK mode{};
     mode.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_MODE_VK;
     mode.header.pNext = nullptr;
-    mode.composeOnPresentQueue = false;
+    mode.composeOnPresentQueue = csFgTuning().composeOnPresentQueue;
 
     ffxCreateContextDescFrameGenerationSwapChainVK desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
@@ -763,10 +824,34 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
     cfg.frameGenerationCallbackUserContext = &ctx;
     cfg.frameGenerationEnabled = false;
-    cfg.allowAsyncWorkloads = false;
+    cfg.allowAsyncWorkloads = csFgTuning().asyncWorkloads;
     cfg.generationRect = { 0, 0, (int32_t)displayW, (int32_t)displayH };
     cfg.frameID = ctx.frameID;
     ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
+
+    // Frame-pacing tuning on the FG SWAPCHAIN context (distinct from the FG interpolation context above).
+    // safetyMargin/varianceFactor shift the pacing algorithm's target frametime (lower => recovers toward
+    // the true framerate faster after a complexity spike, at the cost of higher variance). The hybrid-spin
+    // fields are consumed only once amd_fidelityfx_vk.dll is rebuilt with the VK hybrid-spin port; harmless
+    // on the current prebuilt DLL (its setFramePacingTuning reads only safetyMargin+variance).
+    {
+        const auto& tune = csFgTuning();
+        FfxApiSwapchainFramePacingTuning pacing{};
+        pacing.safetyMarginInMs                = tune.safetyMarginInMs;
+        pacing.varianceFactor                  = tune.varianceFactor;
+        pacing.allowHybridSpin                 = tune.allowHybridSpin;
+        pacing.hybridSpinTime                  = tune.hybridSpinTime;
+        pacing.allowWaitForSingleObjectOnFence = tune.allowWaitForSingleObjectOnFence;
+        ffxConfigureDescFrameGenerationSwapChainKeyValueVK kv{};
+        kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
+        kv.header.pNext = nullptr;
+        kv.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
+        kv.ptr = &pacing;
+        ffxReturnCode_t prc = ffxConfigureSEH(ctx.ffxApi, &ctx.fgSwapchainContext, &kv.header);
+        SL_LOG_INFO("sl.fsr: FG frame-pacing tuning (rc=0x%08X safety=%.3fms variance=%.3f hybridSpin=%d spinTime=%u waitFence=%d)",
+            (uint32_t)prc, pacing.safetyMarginInMs, pacing.varianceFactor,
+            (int)pacing.allowHybridSpin, pacing.hybridSpinTime, (int)pacing.allowWaitForSingleObjectOnFence);
+    }
 
     SL_LOG_INFO("sl.fsr: FFX FG swapchain created (%ux%u, wrapped 0x%llX)", displayW, displayH, (unsigned long long)ctx.fgWrappedSwapchain);
     return true;
@@ -1150,14 +1235,30 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
         dp.renderSize = { renderW, renderH };
         dp.upscaleSize = { outputW, outputH };
         dp.jitterOffset = jitterOffset;
-        dp.frameTimeDelta = 16.6f;
+        // Real frame delta (QPC), not a hardcoded 60Hz value: FSR's reactive/exposure adaptation scales
+        // with frameTimeDelta, so a fixed 16.6 mis-adapts at uncapped/high FPS.
+        {
+            LARGE_INTEGER qpcNow;
+            QueryPerformanceCounter(&qpcNow);
+            float deltaMs = 16.6f;
+            if (ctx.upscaleLastQpc) {
+                LARGE_INTEGER qpcFreq;
+                QueryPerformanceFrequency(&qpcFreq);
+                const double ms = double(qpcNow.QuadPart - ctx.upscaleLastQpc) * 1000.0 / double(qpcFreq.QuadPart);
+                deltaMs = (float)std::min(std::max(ms, 1.0), 100.0);
+            }
+            ctx.upscaleLastQpc = qpcNow.QuadPart;
+            dp.frameTimeDelta = deltaMs;
+        }
         dp.cameraFar = consts->cameraFar;
         dp.cameraNear = consts->cameraNear;
         dp.enableSharpening = sharpness > 0.0f;
         dp.sharpness = sharpness;
         dp.cameraFovAngleVertical = consts->cameraFOV;
         dp.viewSpaceToMetersFactor = 0.01428222656f;
-        dp.reset = false;
+        // Honor the host's camera-cut/reset signal (teleport, fast-travel, menu->game) so FSR flushes its
+        // temporal history for one frame instead of smearing the discontinuity.
+        dp.reset = (consts->reset == Boolean::eTrue);
         dp.preExposure = 1.0f;
         dp.flags = 0;
         rc = ffxDispatchSEH(ctx.ffxApi, &ctx.upscaleContext, &dp.header);
@@ -1467,7 +1568,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
         cfg.frameGenerationCallbackUserContext = &ctx;
         cfg.frameGenerationEnabled = ctx.fgEnabled && ctx.fgPreparedThisFrame;
-        cfg.allowAsyncWorkloads = false;
+        cfg.allowAsyncWorkloads = csFgTuning().asyncWorkloads;
         cfg.flags = ctx.fgDebugFlags;                       // host debug overlays (tear/pacing lines, debug view)
         cfg.onlyPresentGenerated = ctx.fgOnlyPresentGenerated;
         cfg.generationRect = { 0, 0, (int32_t)ctx.fgDisplayW, (int32_t)ctx.fgDisplayH };
