@@ -5,6 +5,17 @@
     "namespace": "fsr",
     "required_plugins": ["sl.common"],
     "rhi": ["vk"],
+    "external": {
+        "vk": {
+            "device": {
+                "queues": {
+                    "graphics": {
+                        "count": 2
+                    }
+                }
+            }
+        }
+    },
     "hooks": [
         {
             "class": "Vulkan",
