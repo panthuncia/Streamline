@@ -595,6 +595,28 @@ project "sl.fsr"
 
 	removefiles {"./source/core/sl.extra/extra.cpp"}
 
+-- Community Shaders sl.fsr_g plugin: AMD FidelityFX FSR3 frame generation (split out of sl.fsr).
+project "sl.fsr_g"
+	kind "SharedLib"
+	targetdir (out_dynamic_lib_dir())
+	objdir (out_obj_dir())
+	characterset ("MBCS")
+	pluginBasicSetup("fsr_g")
+
+	-- FFX-API public headers (descriptor structs for the prebuilt amd_fidelityfx_vk.dll, resolved at
+	-- runtime via LoadLibrary). FFX now lives inside the fork; CS no longer references it directly.
+	includedirs { "./external/fidelityfx-sdk/ffx-api/include" }
+
+	files {
+		"./source/plugins/sl.fsr_g/**.json",
+		"./source/plugins/sl.fsr_g/**.h",
+		"./source/plugins/sl.fsr_g/**.cpp"
+	}
+
+	vpaths { ["impl"] = {"./source/plugins/sl.fsr_g/**.h", "./source/plugins/sl.fsr_g/**.cpp" }}
+
+	removefiles {"./source/core/sl.extra/extra.cpp"}
+
 -- Community Shaders sl.xess plugin: Intel XeSS super-resolution upscaling (upscale-only).
 project "sl.xess"
 	kind "SharedLib"

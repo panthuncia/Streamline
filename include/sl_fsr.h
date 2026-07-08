@@ -1,12 +1,13 @@
 /*
-* Community Shaders sl.fsr plugin — public host API.
+* Community Shaders sl.fsr plugin — public host API (UPSCALE ONLY).
 *
-* AMD FidelityFX FSR3 upscaling + frame generation (both under kFeatureFSR), driven through the
-* same Streamline interposer as DLSS / DLSS-G. The host tags inputs (slSetTagForFrame) + sets common
-* constants (slSetConstants) and calls slEvaluateFeature(kFeatureFSR, ...) exactly like the DLSS path;
-* frame generation is enabled via slFSRFrameGenerationSetOptions and inserted at the present hook.
+* AMD FidelityFX FSR3 upscaling under kFeatureFSR, driven through the same Streamline interposer as
+* DLSS. The host tags inputs (slSetTagForFrame) + sets common constants (slSetConstants) and calls
+* slEvaluateFeature(kFeatureFSR, ...) exactly like the DLSS path. FSR3 FRAME GENERATION lives in a
+* SEPARATE, independently-loadable feature/plugin (kFeatureFSR_G / sl.fsr_g, see sl_fsr_g.h) so it is
+* interchangeable with DLSS-G behind identical hooking — only one FG feature loads at a time.
 *
-* Mirrors sl_dlss.h (upscale) + sl_dlss_g.h (frame gen).
+* Mirrors sl_dlss.h (upscale); the frame-gen half mirrors sl_dlss_g.h (see sl_fsr_g.h).
 */
 
 #pragma once
@@ -53,36 +54,7 @@ SL_STRUCT_BEGIN(FSRState, StructType({ 0xd3b4c5e6, 0x7f80, 0x4192, { 0xa3, 0xb4,
     uint64_t estimatedVRAMUsageInBytes{};
 SL_STRUCT_END()
 
-//! FSR frame-generation options (mirrors DLSSGOptions).
-// {E4C5D6F7-8091-42A3-B4C5-D6E7F8091203}
-SL_STRUCT_BEGIN(FSRFrameGenOptions, StructType({ 0xe4c5d6f7, 0x8091, 0x42a3, { 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x12, 0x03 } }), kStructVersion1)
-    //! True to enable FSR3 frame generation (present-hook interpolation).
-    Boolean enabled = Boolean::eFalse;
-    //! Render (dynamic) size of the tagged depth/MV inputs.
-    uint32_t renderWidth = INVALID_UINT;
-    uint32_t renderHeight = INVALID_UINT;
-    //! Display (back-buffer) size.
-    uint32_t displayWidth = INVALID_UINT;
-    uint32_t displayHeight = INVALID_UINT;
-    //! Whether the presented color is HDR + its peak luminance (for FFX tonemap/transfer-function).
-    Boolean colorBuffersHDR = Boolean::eFalse;
-    float hdrPeakNits = 1000.0f;
-    //! FSR3 frame-generation debug overlays, forwarded to ffxConfigureDescFrameGeneration every present.
-    Boolean debugView = Boolean::eFalse;             //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW
-    Boolean debugTearLines = Boolean::eFalse;        //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES
-    Boolean debugPacingLines = Boolean::eFalse;      //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES
-    Boolean onlyPresentGenerated = Boolean::eFalse;  //! present only generated frames (FFX onlyPresentGenerated)
-SL_STRUCT_END()
-
-//! FSR frame-generation state (mirrors DLSSGState).
-// {F5D6E7081-9102-43B4-C5D6-E7F8091203A4}
-SL_STRUCT_BEGIN(FSRFrameGenState, StructType({ 0xf5d6e708, 0x9102, 0x43b4, { 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x12, 0x03, 0xa4 } }), kStructVersion1)
-    //! 0 == OK.
-    uint32_t status{};
-    //! Frames actually presented per app frame (2 == frame generation doubling is active).
-    uint32_t numFramesActuallyPresented{};
-    uint64_t estimatedVRAMUsageInBytes{};
-SL_STRUCT_END()
+// FSR frame-generation options/state + their APIs live in sl_fsr_g.h (feature kFeatureFSR_G).
 
 }
 
@@ -94,12 +66,6 @@ using PFun_slFSRGetState = sl::Result(const sl::ViewportHandle& viewport, sl::FS
 
 //! Set per-viewport FSR upscale options (mode/output/sharpness). NOT thread safe.
 using PFun_slFSRSetOptions = sl::Result(const sl::ViewportHandle& viewport, const sl::FSROptions& options);
-
-//! Enable/disable + configure FSR frame generation for the given viewport. NOT thread safe.
-using PFun_slFSRFrameGenerationSetOptions = sl::Result(const sl::ViewportHandle& viewport, const sl::FSRFrameGenOptions& options);
-
-//! FSR frame-generation state incl. presented-frame count. NOT thread safe.
-using PFun_slFSRGetFrameGenState = sl::Result(const sl::ViewportHandle& viewport, sl::FSRFrameGenState& state);
 
 //! HELPERS
 inline sl::Result slFSRGetOptimalSettings(const sl::FSROptions& options, sl::FSROptimalSettings& settings)
@@ -118,16 +84,4 @@ inline sl::Result slFSRSetOptions(const sl::ViewportHandle& viewport, const sl::
 {
     SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR, slFSRSetOptions);
     return s_slFSRSetOptions(viewport, options);
-}
-
-inline sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, const sl::FSRFrameGenOptions& options)
-{
-    SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR, slFSRFrameGenerationSetOptions);
-    return s_slFSRFrameGenerationSetOptions(viewport, options);
-}
-
-inline sl::Result slFSRGetFrameGenState(const sl::ViewportHandle& viewport, sl::FSRFrameGenState& state)
-{
-    SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR, slFSRGetFrameGenState);
-    return s_slFSRGetFrameGenState(viewport, state);
 }

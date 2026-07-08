@@ -1,6 +1,6 @@
 /*
 * Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
-* Community Shaders sl.fsr plugin — AMD FidelityFX FSR3 upscaling.
+* Community Shaders sl.fsr_g plugin — AMD FidelityFX FSR3 frame generation.
 */
 #include "source/shared/sharedVersions.h"
 
