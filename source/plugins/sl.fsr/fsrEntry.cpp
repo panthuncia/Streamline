@@ -58,6 +58,7 @@ struct FSRContext
     ffxFunctions ffxApi{};
     ffxContext upscaleContext = nullptr;
     uint32_t ctxRenderW = 0, ctxRenderH = 0, ctxDisplayW = 0, ctxDisplayH = 0;
+    bool ctxColorHDR = false;
     bool dispatchFaulted = false;
 
     // Resolved device functions for the FFX backend + our barriers.
@@ -202,10 +203,11 @@ bool loadFFX(fsr::FSRContext& ctx)
     return true;
 }
 
-bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t renderH, uint32_t displayW, uint32_t displayH)
+bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t renderH,
+    uint32_t displayW, uint32_t displayH, bool colorHDR)
 {
     if (ctx.upscaleContext && ctx.ctxRenderW >= renderW && ctx.ctxRenderH >= renderH &&
-        ctx.ctxDisplayW == displayW && ctx.ctxDisplayH == displayH)
+        ctx.ctxDisplayW == displayW && ctx.ctxDisplayH == displayH && ctx.ctxColorHDR == colorHDR)
         return true;
     if (ctx.upscaleContext) {
         ctx.ffxApi.DestroyContext(&ctx.upscaleContext, nullptr);
@@ -228,7 +230,8 @@ bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t rende
     upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     upscaleDesc.header.pNext = &backendDesc.header;
     // Skyrim's depth is standard [0=near .. 1=far], not reversed-Z, so no FFX_UPSCALE_ENABLE_DEPTH_INVERTED.
-    upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+        (colorHDR ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
     upscaleDesc.maxRenderSize = { renderW, renderH };
     upscaleDesc.maxUpscaleSize = { displayW, displayH };
     upscaleDesc.fpMessage = nullptr;
@@ -240,7 +243,9 @@ bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t rende
         return false;
     }
     ctx.ctxRenderW = renderW; ctx.ctxRenderH = renderH; ctx.ctxDisplayW = displayW; ctx.ctxDisplayH = displayH;
-    SL_LOG_INFO("sl.fsr: FFX upscale context created (render %ux%u display %ux%u)", renderW, renderH, displayW, displayH);
+    ctx.ctxColorHDR = colorHDR;
+    SL_LOG_INFO("sl.fsr: FFX upscale context created (render %ux%u display %ux%u HDR=%s)",
+        renderW, renderH, displayW, displayH, colorHDR ? "true" : "false");
     return true;
 }
 
@@ -307,6 +312,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     // running the epilogue restore loop, so doing them first is what keeps the depth/MV transitions
     // from leaking and desyncing DXVK's image-layout tracking.
     float sharpness = 0.0f;
+    bool colorHDR = false;
     {
         std::lock_guard<std::mutex> lock(ctx.optionsMutex);
         auto it = ctx.upscaleOptions.find((uint32_t)evd.id);
@@ -314,9 +320,10 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             if (it->second.mode == FSRMode::eOff)
                 return Result::eOk;
             sharpness = it->second.sharpness;
+            colorHDR = it->second.colorBuffersHDR == Boolean::eTrue;
         }
     }
-    if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH)) {
+    if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH, colorHDR)) {
         ctx.dispatchFaulted = true;
         return Result::eErrorExceptionHandler;
     }
