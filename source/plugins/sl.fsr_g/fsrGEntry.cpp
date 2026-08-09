@@ -1089,7 +1089,13 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             ctx.compute->getResourceDescription(hres, hdesc);
             VkImage himage = (VkImage)hres->native;
             const VkFormat hfmt = (VkFormat)hdesc.nativeFormat;
-            if (ctx.fgBackBufferVkFormat != VK_FORMAT_UNDEFINED && hfmt == ctx.fgBackBufferVkFormat) {
+            const uint32_t hudlessFormat = ffxApiGetSurfaceFormatVK(hfmt);
+            const uint32_t backBufferFormat = ffxApiGetSurfaceFormatVK(ctx.fgBackBufferVkFormat);
+            const int hudlessGroup = ffxApiFormatPrecisionGroup(hudlessFormat);
+            const int backBufferGroup = ffxApiFormatPrecisionGroup(backBufferFormat);
+            const bool compatible = ctx.fgBackBufferVkFormat != VK_FORMAT_UNDEFINED &&
+                hudlessGroup >= 0 && hudlessGroup == backBufferGroup;
+            if (compatible) {
                 VkImageCreateInfo hinfo = imageInfoFromDesc(hdesc);
                 FfxApiResourceDescription hfdesc = ffxApiGetImageResourceDescriptionVK(himage, hinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
                 ctx.fgHudlessResource = ffxApiGetResourceVK(reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
