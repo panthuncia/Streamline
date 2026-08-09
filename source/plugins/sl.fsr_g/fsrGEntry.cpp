@@ -178,6 +178,9 @@ struct FSRContext
     VkFormat fgBackBufferVkFormat = VK_FORMAT_UNDEFINED;  // the swapchain's VkFormat (R10G10B10A2 in HDR); the
                                         // format the hudless bridge targets so it shares the backbuffer group.
 
+    FfxApiResource fgUiResource{};
+    bool fgHaveUi = false;
+
     // HUDLessColor format bridge (RGBA16F hudless -> backbuffer-format R10G10B10A2 so FFX accepts it in HDR).
     HudlessConvert hc;
     PFN_vkGetPhysicalDeviceMemoryProperties pfnGetMemProps = nullptr;
@@ -1041,6 +1044,8 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     getTaggedResource(kBufferTypeMotionVectors, mvec, evd.frame, evd.id, false, inputs, numInputs);
     CommonResource hudless{};
     getTaggedResource(kBufferTypeHUDLessColor, hudless, evd.frame, evd.id, true, inputs, numInputs);
+    CommonResource uiColor{};
+    getTaggedResource(kBufferTypeUIColorAndAlpha, uiColor, evd.frame, evd.id, true, inputs, numInputs);
     if (!depth || !mvec)
         return Result::eErrorMissingInputParameter;
 
@@ -1107,6 +1112,19 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
                 ctx.fgHudlessCompatible = true;
                 ctx.fgHaveHudless = true;
             }
+        }
+
+        ctx.fgHaveUi = false;
+        if (chi::Resource ures = uiColor; ures && ures->native) {
+            chi::ResourceDescription udesc{};
+            ctx.compute->getResourceDescription(ures, udesc);
+            VkImage uimage = (VkImage)ures->native;
+            VkImageCreateInfo uinfo = imageInfoFromDesc(udesc);
+            FfxApiResourceDescription ufdesc = ffxApiGetImageResourceDescriptionVK(
+                uimage, uinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
+            ctx.fgUiResource = ffxApiGetResourceVK(
+                reinterpret_cast<void*>(uimage), ufdesc, layoutToFfxState((VkImageLayout)ures->state));
+            ctx.fgHaveUi = true;
         }
 
         if (ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
@@ -1329,6 +1347,20 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
     // Interpolate ONLY when the host wants FG AND an FG-prepare ran this frame (else FFX reads empty
     // inputs -> GPU device-lost). FG-off or non-gameplay (menu/loading) frames present 1:1. Configure
     // per-present, matching the canonical FFX sample.
+    if (ctx.fgSwapchainContext) {
+        ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceVK uiCfg{};
+        uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
+        if (ctx.fgHaveUi) {
+            uiCfg.uiResource = ctx.fgUiResource;
+            uiCfg.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
+                          FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+        }
+        const ffxReturnCode_t uiRc = ffxConfigureSEH(ctx.ffxApi, &ctx.fgSwapchainContext, &uiCfg.header);
+        if (uiRc != FFX_API_RETURN_OK) {
+            SL_LOG_ERROR("sl.fsr_g: UI resource registration failed 0x%08X", (uint32_t)uiRc);
+        }
+    }
+
     if (ctx.fgContext) {
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -1344,7 +1376,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         // UI (backbuffer - hudless) and only interpolates the scene, so the HUD doesn't ghost. Only pass it when
         // the FG context was built with a compatible hudless format (same precision group as the backbuffer) —
         // otherwise FFX would read it with the wrong format; empty HUDLessColor in that case (e.g. HDR).
-        if (ctx.fgHaveHudless && ctx.fgHudlessCompatible)
+        if (!ctx.fgHaveUi && ctx.fgHaveHudless && ctx.fgHudlessCompatible)
             cfg.HUDLessColor = ctx.fgHudlessResource;
         cfg.frameID = ctx.frameID;
         ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
@@ -1355,6 +1387,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
 
     ++ctx.frameID;
     ctx.fgPreparedThisFrame = false;
+    ctx.fgHaveUi = false;
     Skip = true;
     return r;
 }
