@@ -1,17 +1,7 @@
 /*
-* Community Shaders sl.fsr_g plugin — public host API (FRAME GENERATION ONLY).
-*
-* AMD FidelityFX FSR3 frame generation under kFeatureFSR_G, split out of sl.fsr (kFeatureFSR, upscale)
-* so it is an independently loadable Streamline feature — a structural twin of sl.dlss_g. Frame
-* generation is enabled via slFSRFrameGenerationSetOptions and inserted at the plugin's own present
-* hook (an FFX FrameInterpolationSwapChain), exactly as sl.dlss_g inserts DLSS-G at its present hook.
-* Only one FG feature (kFeatureFSR_G or kFeatureDLSS_G) is loaded at a time, so the host's load/unload
-* + present-hook behaviour is identical regardless of which frame-generation method is selected.
-*
-* The host tags depth/MV/hudless on a DEDICATED frame-gen viewport (no color) and calls
-* slEvaluateFeature(kFeatureFSR_G, ...) to run the FrameGenerationPrepare, exactly like the upscale
-* evaluate on kFeatureFSR. Mirrors sl_dlss_g.h.
-*/
+ * Public host API for the Community Shaders FSR 3 frame-generation Streamline plugin.
+ * The host tags depth, motion vectors, and HUD-less color on a dedicated viewport.
+ */
 
 #pragma once
 
@@ -23,15 +13,8 @@ namespace sl
 SL_STRUCT_BEGIN(FSRFrameGenOptions, StructType({ 0xe4c5d6f7, 0x8091, 0x42a3, { 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x12, 0x03 } }), kStructVersion1)
     //! True to enable FSR3 frame generation (present-hook interpolation).
     Boolean enabled = Boolean::eFalse;
-    //! Render (dynamic) size of the tagged depth/MV inputs.
-    uint32_t renderWidth = INVALID_UINT;
-    uint32_t renderHeight = INVALID_UINT;
-    //! Display (back-buffer) size.
-    uint32_t displayWidth = INVALID_UINT;
-    uint32_t displayHeight = INVALID_UINT;
-    //! Whether the presented color is HDR + its peak luminance (for FFX tonemap/transfer-function).
+    //! Whether the presented color is HDR.
     Boolean colorBuffersHDR = Boolean::eFalse;
-    float hdrPeakNits = 1000.0f;
     //! FSR3 frame-generation debug overlays, forwarded to ffxConfigureDescFrameGeneration every present.
     Boolean debugView = Boolean::eFalse;             //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW
     Boolean debugTearLines = Boolean::eFalse;        //! FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES
@@ -57,7 +40,15 @@ using PFun_slFSRFrameGenerationSetOptions = sl::Result(const sl::ViewportHandle&
 //! FSR frame-generation state incl. presented-frame count. NOT thread safe.
 using PFun_slFSRGetFrameGenState = sl::Result(const sl::ViewportHandle& viewport, sl::FSRFrameGenState& state);
 
-//! HELPERS
+//! Discard a prepared frame. Returns eErrorInvalidState when no frame was pending. Thread safe.
+using PFun_slFSRFrameGenerationDiscardPreparedFrame = sl::Result(const sl::ViewportHandle& viewport);
+
+//! Return whether the supplied Vulkan swapchain is the active FSR frame-generation replacement. Thread safe.
+using PFun_slFSRFrameGenerationOwnsSwapchain = bool(VkSwapchainKHR swapchain);
+
+//! Complete and confirm FSR swapchain teardown, optionally releasing the interpolation context. Thread safe.
+using PFun_slFSRFrameGenerationCompleteSwapchainTeardown = bool(bool releaseFeatureContext);
+
 inline sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, const sl::FSRFrameGenOptions& options)
 {
     SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR_G, slFSRFrameGenerationSetOptions);
@@ -68,4 +59,31 @@ inline sl::Result slFSRGetFrameGenState(const sl::ViewportHandle& viewport, sl::
 {
     SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR_G, slFSRGetFrameGenState);
     return s_slFSRGetFrameGenState(viewport, state);
+}
+
+inline sl::Result slFSRFrameGenerationDiscardPreparedFrame(const sl::ViewportHandle& viewport)
+{
+    SL_FEATURE_FUN_IMPORT_STATIC(sl::kFeatureFSR_G, slFSRFrameGenerationDiscardPreparedFrame);
+    return s_slFSRFrameGenerationDiscardPreparedFrame(viewport);
+}
+
+inline bool slFSRFrameGenerationOwnsSwapchain(VkSwapchainKHR swapchain)
+{
+    static PFun_slFSRFrameGenerationOwnsSwapchain* s_slFSRFrameGenerationOwnsSwapchain{};
+    if (!s_slFSRFrameGenerationOwnsSwapchain &&
+        slGetFeatureFunction(sl::kFeatureFSR_G, "slFSRFrameGenerationOwnsSwapchain",
+            reinterpret_cast<void*&>(s_slFSRFrameGenerationOwnsSwapchain)) != sl::Result::eOk)
+        return false;
+    return s_slFSRFrameGenerationOwnsSwapchain && s_slFSRFrameGenerationOwnsSwapchain(swapchain);
+}
+
+inline bool slFSRFrameGenerationCompleteSwapchainTeardown(bool releaseFeatureContext)
+{
+    static PFun_slFSRFrameGenerationCompleteSwapchainTeardown* s_slFSRFrameGenerationCompleteSwapchainTeardown{};
+    if (!s_slFSRFrameGenerationCompleteSwapchainTeardown &&
+        slGetFeatureFunction(sl::kFeatureFSR_G, "slFSRFrameGenerationCompleteSwapchainTeardown",
+            reinterpret_cast<void*&>(s_slFSRFrameGenerationCompleteSwapchainTeardown)) != sl::Result::eOk)
+        return false;
+    return s_slFSRFrameGenerationCompleteSwapchainTeardown &&
+        s_slFSRFrameGenerationCompleteSwapchainTeardown(releaseFeatureContext);
 }
