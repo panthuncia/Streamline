@@ -66,6 +66,7 @@ struct XeSSContext
     uint32_t ctxOutputWidth = 0, ctxOutputHeight = 0;
     XeSSMode ctxMode = XeSSMode::eOff;
     bool dispatchFaulted = false;
+    PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
 
     std::mutex optionsMutex;
     std::map<uint32_t, XeSSOptions> options;
@@ -221,6 +222,46 @@ xess_vk_image_view_info makeViewInfo(chi::ICompute* compute, CommonResource& cr,
     info.subresourceRange.layerCount = 1;
     return info;
 }
+
+struct ImageTransition
+{
+    VkImage image;
+    VkImageLayout originalLayout;
+    VkImageLayout xessLayout;
+    VkImageAspectFlags aspect;
+};
+
+VkImageAspectFlags getDepthTransitionAspectMask(VkFormat format)
+{
+    switch (format)
+    {
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        default:
+            return VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+}
+
+void recordTransition(xess::XeSSContext& ctx, VkCommandBuffer cmd, VkImage image,
+    VkImageLayout oldLayout, VkImageLayout newLayout, VkImageAspectFlags aspect)
+{
+    if (oldLayout == newLayout)
+        return;
+
+    VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = { aspect, 0, 1, 0, 1 };
+    ctx.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
 }
 
 sl::Result xessBeginEvaluation(chi::CommandList /*pCmdList*/, const common::EventData& /*evd*/, const sl::BaseStructure** /*inputs*/, uint32_t /*numInputs*/)
@@ -291,11 +332,34 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
     params.jitterOffsetX = consts->jitterOffset.x;
     params.jitterOffsetY = consts->jitterOffset.y;
     params.exposureScale = 1.0f;
-    params.resetHistory = 0;
+    params.resetHistory = consts->reset == Boolean::eTrue;
     params.inputWidth = renderW;
     params.inputHeight = renderH;
 
-    xess_result_t r = ctx.api.vkExecute(ctx.xessContext, (VkCommandBuffer)cmdList, &params);
+    if (!ctx.vkCmdPipelineBarrier)
+        return Result::eErrorNotInitialized;
+
+    chi::Resource colorInResource = colorIn;
+    chi::Resource depthResource = depth;
+    chi::Resource mvecResource = mvec;
+    chi::Resource colorOutResource = colorOut;
+    const VkImageAspectFlags depthTransitionAspect = getDepthTransitionAspectMask(params.depthTexture.format);
+    const ImageTransition transitions[] = {
+        { params.colorTexture.image, static_cast<VkImageLayout>(colorInResource->state), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT },
+        { params.depthTexture.image, static_cast<VkImageLayout>(depthResource->state), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, depthTransitionAspect },
+        { params.velocityTexture.image, static_cast<VkImageLayout>(mvecResource->state), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT },
+        { params.outputTexture.image, static_cast<VkImageLayout>(colorOutResource->state), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT },
+    };
+    const VkCommandBuffer cmd = static_cast<VkCommandBuffer>(cmdList);
+    for (const auto& transition : transitions)
+        recordTransition(ctx, cmd, transition.image, transition.originalLayout, transition.xessLayout, transition.aspect);
+
+    xess_result_t r = ctx.api.vkExecute(ctx.xessContext, cmd, &params);
+
+    for (int i = 3; i >= 0; --i)
+        recordTransition(ctx, cmd, transitions[i].image, transitions[i].xessLayout,
+            transitions[i].originalLayout, transitions[i].aspect);
+
     if (r != XESS_RESULT_SUCCESS)
     {
         SL_LOG_ERROR("sl.xess: xessVKExecute failed (%d) — disabling for this session", (int)r);
@@ -363,6 +427,33 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     if (!param::getPointerParam(parameters, sl::param::common::kComputeAPI, &ctx.compute))
     {
         SL_LOG_ERROR("sl.xess: failed to obtain compute interface");
+        return false;
+    }
+
+    wchar_t systemDirectory[MAX_PATH]{};
+    std::wstring vulkanPath = L"vulkan-1.dll";
+    if (GetSystemDirectoryW(systemDirectory, MAX_PATH))
+        vulkanPath = std::wstring(systemDirectory) + L"\\vulkan-1.dll";
+    if (HMODULE vulkan = LoadLibraryW(vulkanPath.c_str()))
+    {
+        auto getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            reinterpret_cast<void*>(GetProcAddress(vulkan, "vkGetInstanceProcAddr")));
+        chi::Instance instance{};
+        ctx.compute->getInstance(instance);
+        if (getInstanceProcAddr)
+        {
+            auto getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                getInstanceProcAddr(static_cast<VkInstance>(instance), "vkGetDeviceProcAddr"));
+            chi::Device device{};
+            ctx.compute->getDevice(device);
+            if (getDeviceProcAddr)
+                ctx.vkCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
+                    getDeviceProcAddr(static_cast<VkDevice>(device), "vkCmdPipelineBarrier"));
+        }
+    }
+    if (!ctx.vkCmdPipelineBarrier)
+    {
+        SL_LOG_ERROR("sl.xess: failed to resolve vkCmdPipelineBarrier");
         return false;
     }
 

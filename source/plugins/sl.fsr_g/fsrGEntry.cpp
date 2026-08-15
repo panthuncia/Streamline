@@ -104,6 +104,17 @@ struct HudlessConvert
     bool descDirty = true;
 };
 
+struct FrameGenerationFrame
+{
+    FfxApiResource hudlessResource{};
+    FfxApiResource uiResource{};
+    uint64_t frameID = 0;
+    bool prepared = false;
+    bool haveHudless = false;
+    bool hudlessCompatible = false;
+    bool haveUi = false;
+};
+
 struct FSRContext
 {
     SL_PLUGIN_CONTEXT_CREATE_DESTROY(FSRContext);
@@ -127,20 +138,20 @@ struct FSRContext
     // Guards the frame-gen option writes (slFSRFrameGenerationSetOptions) against the render/present threads.
     std::mutex optionsMutex;
 
+    // Transfers prepared resources from the render thread to the present thread as one frame.
+    std::mutex frameMutex;
+    FrameGenerationFrame pendingFrame{};
+    std::atomic<bool> generatedDispatchSucceeded{ false };
+    std::atomic<uint32_t> lastPresentedFrameCount{ 1 };
+
     // --- Frame generation (FFX FrameInterpolationSwapChainVK proxy) -----------------------------
-    // DXVK's swapchain is ALWAYS replaced with an FFX FrameInterpolationSwapChain in the
-    // eVulkan_CreateSwapchainKHR before-hook, independent of whether FG is enabled. With FG disabled the
-    // FFX swapchain is a 1:1 passthrough (frameGenerationEnabled=false), so toggling FG is just an
-    // ffxConfigure in the present hook — never a swapchain recreate (which was the source of every FG
-    // toggle freeze/deadlock). The other WSI before-hooks (GetSwapchainImages/AcquireNextImage/Present/
-    // DestroySwapchain) route the wrapped handle to FFX's replacement functions. Per-frame depth/MV/camera
-    // is recorded by an FG-prepare dispatch appended to the upscale (fsrEndEvaluation).
-    bool fgEnabled = false;                  // host requested FSR FG; gates frameGenerationEnabled only
-    bool fgPreparedThisFrame = false;        // an FG-prepare ran this frame -> safe to interpolate
+    // The present hook recreates the swapchain when FSR FG takes or releases ownership. While wrapped,
+    // the WSI hooks route swapchain operations to FFX and fsrEndEvaluation records the per-frame prepare.
+    bool fgEnabled = false;                  // host requested FSR FG
     bool fgColorHDR = false;
     uint32_t fgDebugFlags = 0;               // FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_* from the host's debug toggles
     bool fgOnlyPresentGenerated = false;     // present only generated frames (host fgShowOnlyGenerated)
-    bool fgGameplayReached = false;          // an upscale has run -> frames are flowing -> safe to install
+    std::atomic<bool> fgGameplayReached{ false }; // an upscale has run -> frames are flowing -> safe to install
                                              // the FFX FG swapchain. Building it at cold init / a no-frame
                                              // loading screen crashes its setup, so the FIRST wrap is deferred
                                              // to here. Latched on; never cleared. NOTE: the swapchain does NOT
@@ -152,7 +163,7 @@ struct FSRContext
                                              // installs the FFX swapchain the first time gameplay is reached.
     bool fgWrapFailed = false;               // createFgSwapchain failed -> stop retriggering the bootstrap
                                              // (else present->recreate->fail loops every frame).
-    uint64_t frameID = 0;
+    uint64_t frameID = 0;                    // protected by frameMutex
     int64_t fgLastPrepareQpc = 0;            // QPC of the last FG-prepare, for real frameTimeDelta
     PFN_vkQueuePresentKHR realQueuePresentKHR = nullptr;
     ffxContext fgContext = nullptr;          // interpolation context (ffxCreateContextDescFrameGeneration)
@@ -170,16 +181,10 @@ struct FSRContext
     // present hook feeds it to ffxConfigure. fgHudlessVkFormat (derived from the tagged resource) is baked into
     // the FG context via the optional hudless create-struct when it differs from the backbuffer (e.g. an
     // RGBA16F scene buffer vs an RGBA8 backbuffer) — without it FFX subtracts the hudless using the wrong format.
-    FfxApiResource fgHudlessResource{};
-    bool fgHaveHudless = false;
-    bool fgHudlessCompatible = false;   // hudless format is in the SAME FFX precision group as the backbuffer
     uint32_t fgHudlessVkFormat = 0;     // VkFormat of the host's hudless texture; 0 => assume == backbuffer
     uint32_t fgCtxHudlessFormat = 0;    // VkFormat the current fgContext was actually built with (recreate on change)
     VkFormat fgBackBufferVkFormat = VK_FORMAT_UNDEFINED;  // the swapchain's VkFormat (R10G10B10A2 in HDR); the
                                         // format the hudless bridge targets so it shares the backbuffer group.
-
-    FfxApiResource fgUiResource{};
-    bool fgHaveUi = false;
 
     // HUDLessColor format bridge (RGBA16F hudless -> backbuffer-format R10G10B10A2 so FFX accepts it in HDR).
     HudlessConvert hc;
@@ -424,7 +429,7 @@ FfxApiResource wrapAndTransition(fsr::FSRContext& ctx, VkCommandBuffer cmd, Comm
 
 // ====================== Frame generation (FFX FrameInterpolationSwapChainVK) =====================
 
-// Serializes ALL ffxDispatch calls on the FG context. The FG-prepare dispatches on the game's
+// Serializes all dispatch and configure calls on the FG context. The FG-prepare dispatches on the game's
 // render thread (inside slEvaluateFeature) while the interpolation dispatch runs on DXVK's submit
 // thread (present -> FFX queuePresent -> FfxFrameGenDispatchCallback) — TWO threads driving ONE
 // FFX context. FFX has no internal lock on this edge and mutates non-atomic per-context state on
@@ -440,10 +445,14 @@ std::mutex g_fgDispatchMutex;
 ffxReturnCode_t FfxFrameGenDispatchCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx)
 {
     auto* ctx = reinterpret_cast<fsr::FSRContext*>(pUserCtx);
-    if (!ctx || !ctx->fgContext)
+    if (!ctx)
         return FFX_API_RETURN_ERROR;
     std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
-    return ffxDispatchSEH(ctx->ffxApi, &ctx->fgContext, &params->header);
+    if (!ctx->fgContext)
+        return FFX_API_RETURN_ERROR;
+    const ffxReturnCode_t result = ffxDispatchSEH(ctx->ffxApi, &ctx->fgContext, &params->header);
+    ctx->generatedDispatchSucceeded.store(result == FFX_API_RETURN_OK, std::memory_order_release);
+    return result;
 }
 
 // Grab the three distinct queues FFX needs (gameQueue from DXVK's own present queue captured earlier;
@@ -526,10 +535,20 @@ static int ffxApiFormatPrecisionGroup(uint32_t fmt)
 // the dispatch callback). Sized to display+maxRender; recreated on size change.
 bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH, uint32_t renderW, uint32_t renderH, uint32_t backBufferFormat)
 {
+    bool colorHDR = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        colorHDR = ctx.fgColorHDR;
+    }
+    uint32_t hudlessVkFormat = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        hudlessVkFormat = ctx.fgHudlessVkFormat;
+    }
     if (ctx.fgContext && ctx.fgDisplayW == displayW && ctx.fgDisplayH == displayH &&
         ctx.fgRenderW >= renderW && ctx.fgRenderH >= renderH && ctx.fgBackBufferFormat == backBufferFormat &&
-        ctx.fgContextHDR == ctx.fgColorHDR &&            // HDR flag is baked into fgDesc.flags at create
-        ctx.fgCtxHudlessFormat == ctx.fgHudlessVkFormat)  // hudless format is baked via the hudless create-struct
+        ctx.fgContextHDR == colorHDR &&                  // HDR flag is baked into fgDesc.flags at create
+        ctx.fgCtxHudlessFormat == hudlessVkFormat)       // hudless format is baked via the hudless create-struct
         return true;
     if (ctx.fgContext) {
         // Wait out any in-flight prepare/interpolation dispatch before destroying the
@@ -553,7 +572,7 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     ffxCreateContextDescFrameGeneration fgDesc{};
     fgDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
     fgDesc.header.pNext = &backendDesc.header;
-    fgDesc.flags = ctx.fgColorHDR ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
+    fgDesc.flags = colorHDR ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
     // Async-compute workloads are disabled (frame generation runs on the game queue).
     // Skyrim's depth is standard [0=near .. 1=far], not reversed-Z, so no FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED.
     fgDesc.displaySize = { displayW, displayH };
@@ -567,17 +586,17 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     // (group 1) while the HDR backbuffer is R10G10B10A2 (group 6). So only chain + use the hudless when its
     // precision group matches the backbuffer's; otherwise run with an empty HUDLessColor (as the dev branch did).
     ffxCreateContextDescFrameGenerationHudless hudlessDesc{};
-    const uint32_t hudlessFormat = ctx.fgHudlessVkFormat ? ffxApiGetSurfaceFormatVK((VkFormat)ctx.fgHudlessVkFormat) : 0;
+    const uint32_t hudlessFormat = hudlessVkFormat ? ffxApiGetSurfaceFormatVK((VkFormat)hudlessVkFormat) : 0;
     const int hudlessGroup = ffxApiFormatPrecisionGroup(hudlessFormat);
     const int backBufferGroup = ffxApiFormatPrecisionGroup(backBufferFormat);
-    ctx.fgHudlessCompatible = hudlessFormat && hudlessGroup >= 0 && hudlessGroup == backBufferGroup;
-    if (ctx.fgHudlessCompatible && hudlessFormat != backBufferFormat) {
+    const bool hudlessCompatible = hudlessFormat && hudlessGroup >= 0 && hudlessGroup == backBufferGroup;
+    if (hudlessCompatible && hudlessFormat != backBufferFormat) {
         hudlessDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS;
         hudlessDesc.header.pNext = &backendDesc.header;
         hudlessDesc.hudlessBackBufferFormat = hudlessFormat;
         fgDesc.header.pNext = &hudlessDesc.header;  // chain: fgDesc -> hudless -> backend
         SL_LOG_INFO("sl.fsr_g: FG context using hudless format %u (backbuffer %u)", hudlessFormat, backBufferFormat);
-    } else if (hudlessFormat && !ctx.fgHudlessCompatible) {
+    } else if (hudlessFormat && !hudlessCompatible) {
         SL_LOG_INFO("sl.fsr_g: hudless format %u (group %d) incompatible with backbuffer %u (group %d) — empty HUDLessColor",
             hudlessFormat, hudlessGroup, backBufferFormat, backBufferGroup);
     }
@@ -599,9 +618,14 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
     }
     ctx.fgDisplayW = displayW; ctx.fgDisplayH = displayH; ctx.fgRenderW = renderW; ctx.fgRenderH = renderH;
     ctx.fgBackBufferFormat = backBufferFormat;
-    ctx.fgContextHDR = ctx.fgColorHDR;
-    ctx.fgCtxHudlessFormat = ctx.fgHudlessVkFormat;
-    ctx.frameID = 0;
+    ctx.fgContextHDR = colorHDR;
+    ctx.fgCtxHudlessFormat = hudlessVkFormat;
+    {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        ctx.frameID = 0;
+        ctx.pendingFrame = {};
+    }
+    ctx.lastPresentedFrameCount.store(1, std::memory_order_release);
     SL_LOG_INFO("sl.fsr_g: FFX FG context created (display %ux%u render %ux%u)", displayW, displayH, renderW, renderH);
     return true;
 }
@@ -610,13 +634,21 @@ bool ensureFgContext(fsr::FSRContext& ctx, uint32_t displayW, uint32_t displayH,
 // VkSwapchainKHR it owns) and unlink the interpolation context.
 void destroyFgSwapchain(fsr::FSRContext& ctx)
 {
-    if (ctx.fgContext) {
-        ffxConfigureDescFrameGeneration cfg{};
-        cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-        cfg.swapChain = nullptr;
-        cfg.frameGenerationEnabled = false;
-        cfg.frameID = ctx.frameID;
-        ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
+    uint64_t frameID = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        frameID = ctx.frameID;
+        ctx.pendingFrame = {};
+    }
+    ffxConfigureDescFrameGeneration cfg{};
+    cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    cfg.swapChain = nullptr;
+    cfg.frameGenerationEnabled = false;
+    cfg.frameID = frameID;
+    {
+        std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
+        if (ctx.fgContext)
+            ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
     }
     if (ctx.fgSwapchainContext) {
         ffxDestroyContextSEH(ctx.ffxApi, &ctx.fgSwapchainContext);
@@ -624,6 +656,7 @@ void destroyFgSwapchain(fsr::FSRContext& ctx)
     }
     ctx.fgSwapchainFns = {};
     ctx.fgWrappedSwapchain = VK_NULL_HANDLE;
+    ctx.lastPresentedFrameCount.store(1, std::memory_order_release);
 }
 
 // Replace DXVK's swapchain with an FFX FrameInterpolationSwapChain. Writes the wrapped handle into
@@ -713,8 +746,15 @@ bool createFgSwapchain(fsr::FSRContext& ctx, VkDevice device, const VkSwapchainC
     cfg.frameGenerationEnabled = false;
     cfg.allowAsyncWorkloads = false;
     cfg.generationRect = { 0, 0, (int32_t)displayW, (int32_t)displayH };
-    cfg.frameID = ctx.frameID;
-    ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
+    {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        cfg.frameID = ctx.frameID;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
+        if (ctx.fgContext)
+            ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
+    }
 
     // Frame-pacing tuning on the FG SWAPCHAIN context (distinct from the FG interpolation context above).
     // safetyMargin/varianceFactor shift the pacing algorithm's target frametime; set to FFX's own
@@ -936,10 +976,10 @@ void hcUpdateDescriptors(fsr::FSRContext& ctx)
     hc.descDirty = false;
 }
 
-// Record the hudless->backbuffer-format copy on the SL evaluate command buffer and point
-// ctx.fgHudlessResource at the converted (FFX-compatible) image. Returns false on any setup failure.
+// Record the hudless->backbuffer-format copy on the SL evaluate command buffer and return the
+// converted FFX resource. Returns false on any setup failure.
 bool convertHudless(fsr::FSRContext& ctx, VkCommandBuffer cmd, VkImage src, VkFormat srcFmt,
-    VkImageLayout srcLayout, uint32_t w, uint32_t h)
+    VkImageLayout srcLayout, uint32_t w, uint32_t h, FfxApiResource& converted)
 {
     auto& hc = ctx.hc;
     if (ctx.fgBackBufferVkFormat == VK_FORMAT_UNDEFINED || !ctx.vkCmdPipelineBarrier)
@@ -996,7 +1036,7 @@ bool convertHudless(fsr::FSRContext& ctx, VkCommandBuffer cmd, VkImage src, VkFo
     info.mipLevels = 1; info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     FfxApiResourceDescription fdesc = ffxApiGetImageResourceDescriptionVK(hc.dstImage, info, FFX_API_RESOURCE_USAGE_READ_ONLY);
-    ctx.fgHudlessResource = ffxApiGetResourceVK(reinterpret_cast<void*>(hc.dstImage), fdesc, FFX_API_RESOURCE_STATE_COMMON);
+    converted = ffxApiGetResourceVK(reinterpret_cast<void*>(hc.dstImage), fdesc, FFX_API_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -1076,8 +1116,15 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     // records this frame's dilated depth/MV + camera/render size for the present-time interpolation.
     // Setting fgGameplayReached lets the present hook bootstrap-install the FFX swapchain; the prepare
     // dispatch itself only runs once that swapchain (and its FG context) exists.
-    if (ctx.fgEnabled) {
-        ctx.fgGameplayReached = true;
+    bool fgEnabled = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        fgEnabled = ctx.fgEnabled;
+    }
+    if (fgEnabled) {
+        ctx.fgGameplayReached.store(true, std::memory_order_release);
+        fsr::FrameGenerationFrame frame{};
+        uint32_t hudlessVkFormat = 0;
 
         // Capture HUDLessColor for present-time UI extraction. NO transition here — FFX consumes it on its own
         // present command buffer, so we declare it in its CURRENT DXVK layout (FFX transitions from/back to it)
@@ -1087,8 +1134,6 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
         // was 0 at create -> no hudless create-struct chained). So if the host's hudless is already that format, feed
         // it directly; otherwise (HDR: RGBA16F scene vs R10G10B10A2 backbuffer) bridge it through the compute copy so
         // its precision group matches and FFX accepts it for HUD extraction instead of dropping it.
-        ctx.fgHaveHudless = false;
-        ctx.fgHudlessCompatible = false;
         if (chi::Resource hres = hudless; hres && hres->native) {
             chi::ResourceDescription hdesc{};
             ctx.compute->getResourceDescription(hres, hdesc);
@@ -1103,18 +1148,19 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             if (compatible) {
                 VkImageCreateInfo hinfo = imageInfoFromDesc(hdesc);
                 FfxApiResourceDescription hfdesc = ffxApiGetImageResourceDescriptionVK(himage, hinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
-                ctx.fgHudlessResource = ffxApiGetResourceVK(reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
-                ctx.fgHudlessVkFormat = hfmt;
-                ctx.fgHudlessCompatible = true;
-                ctx.fgHaveHudless = true;
-            } else if (convertHudless(ctx, cmd, himage, hfmt, (VkImageLayout)hres->state, hdesc.width, hdesc.height)) {
-                ctx.fgHudlessVkFormat = ctx.fgBackBufferVkFormat;  // bridged image is now the backbuffer format
-                ctx.fgHudlessCompatible = true;
-                ctx.fgHaveHudless = true;
+                frame.hudlessResource = ffxApiGetResourceVK(
+                    reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
+                hudlessVkFormat = hfmt;
+                frame.hudlessCompatible = true;
+                frame.haveHudless = true;
+            } else if (convertHudless(ctx, cmd, himage, hfmt, (VkImageLayout)hres->state,
+                           hdesc.width, hdesc.height, frame.hudlessResource)) {
+                hudlessVkFormat = ctx.fgBackBufferVkFormat;
+                frame.hudlessCompatible = true;
+                frame.haveHudless = true;
             }
         }
 
-        ctx.fgHaveUi = false;
         if (chi::Resource ures = uiColor; ures && ures->native) {
             chi::ResourceDescription udesc{};
             ctx.compute->getResourceDescription(ures, udesc);
@@ -1122,15 +1168,19 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             VkImageCreateInfo uinfo = imageInfoFromDesc(udesc);
             FfxApiResourceDescription ufdesc = ffxApiGetImageResourceDescriptionVK(
                 uimage, uinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
-            ctx.fgUiResource = ffxApiGetResourceVK(
+            frame.uiResource = ffxApiGetResourceVK(
                 reinterpret_cast<void*>(uimage), ufdesc, layoutToFfxState((VkImageLayout)ures->state));
-            ctx.fgHaveUi = true;
+            frame.haveUi = true;
+        }
+
+        if (hudlessVkFormat) {
+            std::lock_guard<std::mutex> lock(ctx.frameMutex);
+            ctx.fgHudlessVkFormat = hudlessVkFormat;
         }
 
         if (ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
             ffxDispatchDescFrameGenerationPrepare prep{};
             prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-            prep.frameID = ctx.frameID;
             prep.flags = 0;
             prep.commandList = reinterpret_cast<void*>(cmd);
             prep.renderSize = { renderW, renderH };
@@ -1160,10 +1210,15 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             prep.depth = depthRes;
             prep.motionVectors = mvecRes;
             {
-                // Render thread; races the present-thread interpolation dispatch on the same
-                // FG context without this lock (see g_fgDispatchMutex).
-                std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
-                ctx.fgPreparedThisFrame = (ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK);
+                std::lock_guard<std::mutex> frameLock(ctx.frameMutex);
+                prep.frameID = ctx.frameID;
+                frame.frameID = prep.frameID;
+                {
+                    std::lock_guard<std::mutex> dispatchLock(g_fgDispatchMutex);
+                    frame.prepared = ctx.fgContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE &&
+                        ffxDispatchSEH(ctx.ffxApi, &ctx.fgContext, &prep.header) == FFX_API_RETURN_OK;
+                }
+                ctx.pendingFrame = frame.prepared ? frame : fsr::FrameGenerationFrame{};
             }
         }
     }
@@ -1177,21 +1232,31 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
 sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, const sl::FSRFrameGenOptions& options)
 {
     auto& ctx = (*fsr::getContext());
-    std::lock_guard<std::mutex> lock(ctx.optionsMutex);
     const bool want = options.enabled == Boolean::eTrue;
-    if (want != ctx.fgEnabled) {
-        // A real on/off edge: let the present hook (re)trigger the wrap/unwrap recreate this frame.
-        ctx.fgBootstrapInFlight = false;
-        ctx.fgWrapFailed = false;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        changed = want != ctx.fgEnabled;
+        if (changed) {
+            // A real on/off edge: let the present hook (re)trigger the wrap/unwrap recreate this frame.
+            ctx.fgBootstrapInFlight = false;
+            ctx.fgWrapFailed = false;
+        }
+        ctx.fgEnabled = want;
+        ctx.fgColorHDR = options.colorBuffersHDR == Boolean::eTrue;
+        // Debug overlays applied per-present via ffxConfigureDescFrameGeneration (see slHookVkQueuePresentKHR).
+        ctx.fgDebugFlags =
+            (options.debugView == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0u) |
+            (options.debugTearLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0u) |
+            (options.debugPacingLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES : 0u);
+        ctx.fgOnlyPresentGenerated = options.onlyPresentGenerated == Boolean::eTrue;
     }
-    ctx.fgEnabled = want;
-    ctx.fgColorHDR = options.colorBuffersHDR == Boolean::eTrue;
-    // Debug overlays applied per-present via ffxConfigureDescFrameGeneration (see slHookVkQueuePresentKHR).
-    ctx.fgDebugFlags =
-        (options.debugView == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0u) |
-        (options.debugTearLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0u) |
-        (options.debugPacingLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES : 0u);
-    ctx.fgOnlyPresentGenerated = options.onlyPresentGenerated == Boolean::eTrue;
+    if (changed) {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        ctx.pendingFrame = {};
+    }
+    if (!want)
+        ctx.lastPresentedFrameCount.store(1, std::memory_order_release);
     // Publish to the shared param store so the interposer's vkCreateSwapchainKHR dispatch suppresses
     // sl.dlss_g's swapchain hook while FSR FG owns present (prevents the two-present-owner device-lost,
     // enabling in-game FSR-FG ↔ DLSS-G switching).
@@ -1204,8 +1269,7 @@ sl::Result slFSRGetFrameGenState(const sl::ViewportHandle& /*viewport*/, sl::FSR
 {
     auto& ctx = (*fsr::getContext());
     state.status = 0;
-    // 2 == frame generation is actually doubling (FFX swapchain live + an FG-prepare ran).
-    state.numFramesActuallyPresented = (ctx.fgEnabled && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) ? 2 : 1;
+    state.numFramesActuallyPresented = ctx.lastPresentedFrameCount.load(std::memory_order_acquire);
     state.estimatedVRAMUsageInBytes = 0;
     return Result::eOk;
 }
@@ -1232,9 +1296,14 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
             return r;
         }
     }
+    bool fgEnabled = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        fgEnabled = ctx.fgEnabled;
+    }
     SL_LOG_INFO("sl.fsr_g: CreateSwapchainKHR (fgEnabled=%d) — %s",
-        (int)ctx.fgEnabled,
-        (ctx.platform == RenderAPI::eVulkan && ctx.fgEnabled) ? "will wrap" : "pass-through");
+        (int)fgEnabled,
+        (ctx.platform == RenderAPI::eVulkan && fgEnabled) ? "will wrap" : "pass-through");
     if (ctx.physicalDevice == VK_NULL_HANDLE) {
         chi::PhysicalDevice physical{};
         if (ctx.compute) { ctx.compute->getPhysicalDevice(physical); ctx.physicalDevice = (VkPhysicalDevice)physical; }
@@ -1244,7 +1313,7 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
     // SL interposer — that is the path DLSS-G needs. The present hook drives the recreate that re-enters
     // this hook on every on/off transition, so FSR FG ↔ DLSS-G ↔ disabled switch in-game. Gating on
     // fgEnabled (never set at cold init / menus) also avoids the no-frame-production crash.
-    if (ctx.platform != RenderAPI::eVulkan || !ctx.fgEnabled) {
+    if (ctx.platform != RenderAPI::eVulkan || !fgEnabled) {
         Skip = false;
         return VK_SUCCESS;
     }
@@ -1252,13 +1321,18 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
         Skip = false;
         return VK_SUCCESS;
     }
-    ctx.fgBootstrapInFlight = false;  // the bootstrap recreate we asked for has arrived
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        ctx.fgBootstrapInFlight = false;
+    }
     if (createFgSwapchain(ctx, Device, CreateInfo, Allocator, Swapchain)) {
         Skip = true;  // *Swapchain now holds FFX's wrapped handle
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
         ctx.fgWrapFailed = false;
     } else {
         SL_LOG_WARN("sl.fsr_g: FG swapchain proxy failed; falling back to a normal swapchain");
         Skip = false;
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
         ctx.fgWrapFailed = true;  // don't loop on the bootstrap recreate
     }
     return VK_SUCCESS;
@@ -1312,18 +1386,30 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
     if (ctx.gameQueue == VK_NULL_HANDLE)
         ctx.gameQueue = Queue;
 
+    bool fgEnabled = false;
+    uint32_t fgDebugFlags = 0;
+    bool fgOnlyPresentGenerated = false;
+    bool needRecreate = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        fgEnabled = ctx.fgEnabled;
+        fgDebugFlags = ctx.fgDebugFlags;
+        fgOnlyPresentGenerated = ctx.fgOnlyPresentGenerated;
+        needRecreate = ctx.fgGameplayReached.load(std::memory_order_acquire) &&
+            !ctx.fgBootstrapInFlight && !ctx.fgWrapFailed &&
+            ((fgEnabled && ctx.fgWrappedSwapchain == VK_NULL_HANDLE && !wrapped) ||
+             (!fgEnabled && wrapped));
+        if (needRecreate)
+            ctx.fgBootstrapInFlight = true;
+    }
+
     // Bidirectional wrap/unwrap so FSR FG ↔ DLSS-G ↔ disabled switch in-game. The desired state is "wrapped
     // iff FSR FG is on" (ctx.fgEnabled); the actual state is whether THIS swapchain is our FFX handle. On a
     // mismatch, present this frame on its real path then return VK_SUBOPTIMAL_KHR so DXVK recreates its
     // swapchain — re-entering CreateSwapchainKHR, which wraps (fgEnabled) or leaves it plain (returning
     // present to SL for DLSS-G). Presenting first avoids the dangling-fence hang of a no-present OUT_OF_DATE.
     // fgBootstrapInFlight de-bounces to one trigger per recreate; fgWrapFailed stops a wrap-fail loop.
-    const bool wantWrap = ctx.fgEnabled;
-    const bool needRecreate = ctx.fgGameplayReached && !ctx.fgBootstrapInFlight && !ctx.fgWrapFailed &&
-        ((wantWrap && ctx.fgWrappedSwapchain == VK_NULL_HANDLE && !wrapped) ||  // turn ON: install FFX wrap
-         (!wantWrap && wrapped));                                               // turn OFF: drop back to plain
     if (needRecreate) {
-        ctx.fgBootstrapInFlight = true;
         Skip = true;
         // Present this frame on the path that owns it now: FFX's present if currently wrapped (turning OFF),
         // else the genuine driver present (turning ON, still a plain swapchain).
@@ -1334,7 +1420,8 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
             pr = ctx.realQueuePresentKHR(Queue, PresentInfo);
         else
             pr = VK_SUCCESS;
-        SL_LOG_INFO("sl.fsr_g: recreate to %s FG (present rc=%d)", wantWrap ? "ENABLE" : "DISABLE", (int)pr);
+        ctx.lastPresentedFrameCount.store(1, std::memory_order_release);
+        SL_LOG_INFO("sl.fsr_g: recreate to %s FG (present rc=%d)", fgEnabled ? "ENABLE" : "DISABLE", (int)pr);
         return pr < 0 ? pr : VK_SUBOPTIMAL_KHR;
     }
 
@@ -1344,14 +1431,24 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         return VK_SUCCESS;
     }
 
+    fsr::FrameGenerationFrame frame{};
+    uint64_t frameID = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx.frameMutex);
+        frameID = ctx.frameID++;
+        if (ctx.pendingFrame.prepared && ctx.pendingFrame.frameID == frameID)
+            frame = ctx.pendingFrame;
+        ctx.pendingFrame = {};
+    }
+
     // Interpolate ONLY when the host wants FG AND an FG-prepare ran this frame (else FFX reads empty
     // inputs -> GPU device-lost). FG-off or non-gameplay (menu/loading) frames present 1:1. Configure
     // per-present, matching the canonical FFX sample.
     if (ctx.fgSwapchainContext) {
         ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceVK uiCfg{};
         uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
-        if (ctx.fgHaveUi) {
-            uiCfg.uiResource = ctx.fgUiResource;
+        if (frame.haveUi) {
+            uiCfg.uiResource = frame.uiResource;
             uiCfg.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
                           FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
         }
@@ -1361,33 +1458,41 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         }
     }
 
+    bool generatedFrameConfigured = false;
     if (ctx.fgContext) {
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = reinterpret_cast<void*>(ctx.fgWrappedSwapchain);
         cfg.frameGenerationCallback = &FfxFrameGenDispatchCallback;
         cfg.frameGenerationCallbackUserContext = &ctx;
-        cfg.frameGenerationEnabled = ctx.fgEnabled && ctx.fgPreparedThisFrame;
+        cfg.frameGenerationEnabled = fgEnabled && frame.prepared;
         cfg.allowAsyncWorkloads = false;
-        cfg.flags = ctx.fgDebugFlags;                       // host debug overlays (tear/pacing lines, debug view)
-        cfg.onlyPresentGenerated = ctx.fgOnlyPresentGenerated;
+        cfg.flags = fgDebugFlags;
+        cfg.onlyPresentGenerated = fgOnlyPresentGenerated;
         cfg.generationRect = { 0, 0, (int32_t)ctx.fgDisplayW, (int32_t)ctx.fgDisplayH };
         // HUDLessColor: the scene without UI, captured this frame in fsrEndEvaluation. With it, FFX extracts the
         // UI (backbuffer - hudless) and only interpolates the scene, so the HUD doesn't ghost. Only pass it when
         // the FG context was built with a compatible hudless format (same precision group as the backbuffer) —
         // otherwise FFX would read it with the wrong format; empty HUDLessColor in that case (e.g. HDR).
-        if (!ctx.fgHaveUi && ctx.fgHaveHudless && ctx.fgHudlessCompatible)
-            cfg.HUDLessColor = ctx.fgHudlessResource;
-        cfg.frameID = ctx.frameID;
-        ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header);
+        if (!frame.haveUi && frame.haveHudless && frame.hudlessCompatible)
+            cfg.HUDLessColor = frame.hudlessResource;
+        cfg.frameID = frameID;
+        {
+            std::lock_guard<std::mutex> lock(g_fgDispatchMutex);
+            const ffxReturnCode_t configureResult = ctx.fgContext ?
+                ffxConfigureSEH(ctx.ffxApi, &ctx.fgContext, &cfg.header) : FFX_API_RETURN_ERROR;
+            generatedFrameConfigured = cfg.frameGenerationEnabled && configureResult == FFX_API_RETURN_OK;
+        }
     }
 
+    ctx.generatedDispatchSucceeded.store(false, std::memory_order_release);
+    ctx.lastPresentedFrameCount.store(1, std::memory_order_release);
     VkResult r = ctx.fgSwapchainFns.pOutQueuePresentKHR ?
         ctx.fgSwapchainFns.pOutQueuePresentKHR(Queue, PresentInfo) : VK_ERROR_INITIALIZATION_FAILED;
 
-    ++ctx.frameID;
-    ctx.fgPreparedThisFrame = false;
-    ctx.fgHaveUi = false;
+    if (generatedFrameConfigured && r >= 0 &&
+        ctx.generatedDispatchSucceeded.load(std::memory_order_acquire))
+        ctx.lastPresentedFrameCount.store(2, std::memory_order_release);
     Skip = true;
     return r;
 }
