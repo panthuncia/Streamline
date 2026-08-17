@@ -8,12 +8,12 @@ mr.bat
 fb.bat
 .vs/
 **/*.aps
-tools/premake5/**
+tools/premake5
 # Packman-pulled dependencies (fetched by setup.bat, never committed)
-/external/gtest/
-/external/imgui/
-/external/implot/
-/external/nvapi/
-/external/pix/
-/external/slang/
-/external/vulkan/
+/external/gtest
+/external/imgui
+/external/implot
+/external/nvapi
+/external/pix
+/external/slang
+/external/vulkan

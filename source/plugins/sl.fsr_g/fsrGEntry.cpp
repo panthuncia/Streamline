@@ -589,7 +589,11 @@ bool destroyFgSwapchain(fsr::FSRContext& ctx)
     ctx.pendingFrame = {};
     ffxConfigureDescFrameGeneration cfg{};
     cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-    cfg.swapChain = nullptr;
+    // FidelityFX requires the live replacement swapchain even when disabling
+    // frame generation. A null swapchain makes the Vulkan provider return
+    // FFX_API_RETURN_ERROR_RUNTIME_ERROR, leaving the replacement context live
+    // and causing every subsequent DXVK recreation attempt to fail teardown.
+    cfg.swapChain = reinterpret_cast<void*>(ctx.fgWrappedSwapchain);
     cfg.frameGenerationEnabled = false;
     cfg.frameID = frameID;
     if (ctx.fgContext) {
