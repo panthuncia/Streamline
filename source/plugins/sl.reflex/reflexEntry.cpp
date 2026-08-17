@@ -195,6 +195,10 @@ struct LatencyContext
     //! Stats initialized or not
     std::atomic<bool> initialized = false;
     std::atomic<bool> enabled = false;
+    // A translation layer may own the Vulkan swapchain and its presentation
+    // timeline. In that case it drives the vendor API, while this plugin remains
+    // logically active for Streamline features and token/PCL bookkeeping.
+    std::atomic<bool> externalPacing = false;
 
     PFunSetPCLStatsMarker* setStatsMarkerFunc = nullptr;
     
@@ -315,7 +319,7 @@ Result slSetData(const BaseStructure* inputs, CommandBuffer* cmdBuffer)
         // Special 'marker' for low latency mode
         if (evd_id == kReflexMarkerSleep)
         {
-            if (ctx.lowLatencyAvailable)
+            if (ctx.lowLatencyAvailable && !ctx.externalPacing.load())
             {
 #ifdef SL_PRODUCTION
                 ctx.lowLatencyAvailable = ctx.compute->sleep() == chi::ComputeStatus::eOk;
@@ -335,7 +339,7 @@ Result slSetData(const BaseStructure* inputs, CommandBuffer* cmdBuffer)
             // Made sure it's not special kReflexMarkerSleep value, so should be "safe" to cast to valid PCLMarker enum
             assert(evd_id < to_underlying(PCLMarker::eMaximum));
             const PCLMarker pcl_marker = (PCLMarker)evd_id;
-            if (ctx.lowLatencyAvailable && pcl_marker != PCLMarker::ePCLatencyPing
+            if (ctx.lowLatencyAvailable && !ctx.externalPacing.load() && pcl_marker != PCLMarker::ePCLatencyPing
                 && (pcl_marker != PCLMarker::eTriggerFlash || ctx.flashIndicatorDriverControlled))
             {
                 CHI_VALIDATE(ctx.compute->setReflexMarker(pcl_marker, *frame));
@@ -359,8 +363,13 @@ Result slSetData(const BaseStructure* inputs, CommandBuffer* cmdBuffer)
                 if (ctx.enabled.load())
                 {
                     uint32_t frame = 0;
-                    CHI_VALIDATE(ctx.compute->getFinishedFrameIndex(frame));
-                    api::getContext()->parameters->set(sl::param::latency::kCurrentFrame, frame + 1);
+                    if (ctx.externalPacing.load())
+                        frame = *findStruct<FrameToken>(inputs);
+                    else {
+                        CHI_VALIDATE(ctx.compute->getFinishedFrameIndex(frame));
+                        frame += 1;
+                    }
+                    api::getContext()->parameters->set(sl::param::latency::kCurrentFrame, frame);
                 }
             }
 
@@ -429,7 +438,7 @@ Result slSetData(const BaseStructure* inputs, CommandBuffer* cmdBuffer)
                 ctx.constants.useMarkersToOptimize = ctx.useMarkersToOptimizeOverrideValue;
             }
 #endif
-            if (ctx.lowLatencyAvailable)
+            if (ctx.lowLatencyAvailable && !ctx.externalPacing.load())
             {
                 CHI_VALIDATE(ctx.compute->setSleepMode(ctx.constants));
             }
@@ -825,6 +834,14 @@ sl::Result slReflexSetOptions(const sl::ReflexOptions& options)
     return slSetData(&options, nullptr);
 }
 
+sl::Result slReflexSetExternalPacing(bool enabled)
+{
+    auto& ctx = (*reflex::getContext());
+    ctx.externalPacing.store(enabled);
+    SL_LOG_INFO("Reflex physical pacing owner: %s", enabled ? "external" : "Streamline");
+    return sl::Result::eOk;
+}
+
 //! The only exported function - gateway to all functionality
 SL_EXPORT void* slGetPluginFunction(const char* functionName)
 {
@@ -839,6 +856,7 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     SL_EXPORT_FUNCTION(slReflexSetMarker);
     SL_EXPORT_FUNCTION(slReflexSleep);
     SL_EXPORT_FUNCTION(slReflexSetOptions);
+    SL_EXPORT_FUNCTION(slReflexSetExternalPacing);
 
     SL_EXPORT_FUNCTION(slReflexSetCameraData);
     SL_EXPORT_FUNCTION(slReflexGetPredictedCameraData);
